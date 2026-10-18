@@ -32,7 +32,7 @@ import argparse
 import asyncio
 import time
 import threading
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 
 # Ensure venv site-packages on path
@@ -44,6 +44,7 @@ if os.path.exists(venv_site):
 from mcp.server.fastmcp import FastMCP, Context, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -208,8 +209,10 @@ Recommended workflow:
    for a whole graph). Fall back to create_node + connect_nodes for small edits.
 3. Port IDs must match exactly. Atomic nodes output "unique_filter_output";
    library nodes (create_instance_node) have custom port names, so call
-   get_node_info before connecting them. list_documentation(category="port_reference")
-   lists known ports, and list_documentation(action="search", query=...) searches all docs.
+   get_node_info before connecting them. A wrong port ID fails with the node's valid
+   port IDs (closest match first), so read the error and retry with the suggested ID.
+   list_documentation(category="port_reference") lists known ports, and
+   list_documentation(action="search", query=...) searches all docs.
 4. To check the result visually, open the 3D view in SD (F3) and call
    capture_3d_view, which returns the rendered preview as an image. Iterate with
    set_parameter, then capture again (refresh_first=True if the render looks stale).
@@ -232,6 +235,74 @@ _DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
                                idempotentHint=True, openWorldHint=False)
 _ARBITRARY = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
                              idempotentHint=False, openWorldHint=False)
+
+
+# ---------------------------------------------------------------------------
+# Typed tool inputs (documented in the MCP input schema). They are dumped back
+# to the plain dicts the plugin expects, so the TCP wire format is unchanged.
+# ---------------------------------------------------------------------------
+Position = List[float]
+ParamOverrides = Dict[str, Any]
+
+_PARAMS_DESC = (
+    "Parameter overrides keyed by parameter ID. A bare value is type-inferred "
+    "(numbers -> float, 2/3/4-element lists -> float2/3/4, bools, strings); use "
+    "{\"value\": ..., \"type\": \"int2\"} to force a type, e.g. "
+    "{\"intensity\": 10.0, \"blendingmode\": {\"value\": 3, \"type\": \"int\"}}.")
+
+
+class BatchNode(BaseModel):
+    """One node to create in create_batch_graph."""
+    model_config = ConfigDict(extra="allow")
+
+    id_alias: Optional[str] = Field(
+        None, description="Name used to reference this node in connections "
+                          "(default: last part of definition_id). Duplicates get _1, _2 suffixes.")
+    definition_id: Optional[str] = Field(
+        None, description="Atomic node definition, e.g. 'sbs::compositing::blur' or "
+                          "'sbs::compositing::output' (default: sbs::compositing::uniform). "
+                          "Omit for library nodes.")
+    resource_url: Optional[str] = Field(
+        None, description="Library node URL from get_library_nodes, "
+                          "e.g. 'pkg:///cells_1?dependency=...'.")
+    library_keyword: Optional[str] = Field(
+        None, description="Library node identifier resolved by the plugin, e.g. 'perlin_noise', "
+                          "'cells_1' (alternative to resource_url).")
+    position: Optional[Position] = Field(
+        None, min_length=2, max_length=2,
+        description="[x, y] in the graph editor (default [0, 0]).")
+    usage: Optional[str] = Field(
+        None, description="Output nodes only: baseColor, normal, height, roughness, metallic, "
+                          "ambientOcclusion, emissive, opacity.")
+    label: Optional[str] = Field(
+        None, description="Output nodes only: display label (default: usage).")
+    parameters: Optional[ParamOverrides] = Field(None, description=_PARAMS_DESC)
+
+
+class BatchConnection(BaseModel):
+    """One connection to make in create_batch_graph."""
+    model_config = ConfigDict(extra="allow")
+
+    from_: str = Field(
+        validation_alias=AliasChoices("from", "from_alias"), serialization_alias="from",
+        description="id_alias of the source node.")
+    to: str = Field(
+        validation_alias=AliasChoices("to", "to_alias"), serialization_alias="to",
+        description="id_alias of the destination node.")
+    from_output: str = Field(
+        "unique_filter_output",
+        description="Output port ID on the source. Atomic nodes use 'unique_filter_output'; "
+                    "library nodes have custom names (single-output nodes are auto-resolved).")
+    to_input: str = Field(
+        "input1",
+        description="Input port ID on the destination, e.g. 'input1', blend 'source'/"
+                    "'destination'/'opacity', output nodes 'inputNodeOutput'. Invalid IDs fail "
+                    "with the node's valid port IDs, closest match first.")
+
+
+def _dump(items) -> list:
+    """Pydantic models -> plain dicts for the plugin (aliased keys, unset Nones dropped)."""
+    return [i.model_dump(by_alias=True, exclude_none=True) for i in items or []]
 
 
 # ======================================================================
@@ -740,8 +811,8 @@ async def capture_3d_view(ctx: Context,
 async def create_batch_graph(ctx: Context,
                              graph_name: str,
                              package_index: int = 0,
-                             nodes: Optional[List[dict]] = None,
-                             connections: Optional[List[dict]] = None,
+                             nodes: Optional[List[BatchNode]] = None,
+                             connections: Optional[List[BatchConnection]] = None,
                              output_size_log2: int = 11,
                              open_in_editor: bool = True,
                              package_path: Optional[str] = None) -> str:
@@ -770,19 +841,20 @@ async def create_batch_graph(ctx: Context,
         "to_input": "inputNodeOutput"       # required for output nodes
       }
 
-    IMPORTANT for library nodes in batch:
-      - Use "resource_url" (not "definition_id") for library nodes
-      - You MUST know the output port IDs in advance
-        (run create_instance_node + get_node_info first in test mode)
-      - Batch does NOT validate library node port IDs automatically
+    Library nodes in batch:
+      - Use "resource_url" or "library_keyword" (not "definition_id")
+      - Single-output library nodes auto-resolve from_output; for multi-output
+        nodes a wrong port ID fails that connection, and its error lists the
+        valid port IDs (closest match first) so you can reconnect.
 
-    Returns: node_map {alias -> actual_node_id} + creation stats
+    Returns: node_map {alias -> actual_node_id} + creation stats, plus a
+    per-connection list with the resolved ports or the error.
     """
     return await _async_send("create_batch_graph", {
         "graph_name": graph_name,
         "package_index": package_index,
-        "nodes": nodes or [],
-        "connections": connections or [],
+        "nodes": _dump(nodes),
+        "connections": _dump(connections),
         "output_size_log2": output_size_log2,
         "open_in_editor": open_in_editor,
         "package_path": package_path,
@@ -817,7 +889,7 @@ async def build_material_graph(ctx: Context,
                                 graph_name: str,
                                 recipe_name: str,
                                 package_index: int = 0,
-                                overrides: Optional[dict] = None,
+                                overrides: Optional[Dict[str, ParamOverrides]] = None,
                                 output_size_log2: int = 11,
                                 open_in_editor: bool = True,
                                 package_path: Optional[str] = None) -> str:
@@ -833,7 +905,8 @@ async def build_material_graph(ctx: Context,
 
     Each recipe generates: Height + Normal + Roughness + AO + BaseColor + Metallic outputs.
 
-    overrides: optional dict to override node parameters, keyed by node alias.
+    overrides: optional parameter overrides keyed by recipe node alias, e.g.
+      {"<alias>": {"intensity": 8.0}} (get_recipe_info lists the aliases).
     output_size_log2: 10=1024, 11=2048, 12=4096
     """
     return await _async_send("build_material_graph", {
@@ -885,7 +958,7 @@ async def apply_recipe(ctx: Context,
                         recipe_name: str,
                         graph_identifier: Optional[str] = None,
                         position_offset: Optional[List[float]] = None,
-                        overrides: Optional[dict] = None) -> str:
+                        overrides: Optional[Dict[str, ParamOverrides]] = None) -> str:
     """
     Apply a recipe to an EXISTING graph (adds nodes + connections to current graph).
     Useful for layering multiple materials or adding detail passes.
@@ -893,7 +966,8 @@ async def apply_recipe(ctx: Context,
     recipe_name: any key from list_recipes
     graph_identifier: target graph (None = current active graph)
     position_offset: [x, y] to offset all node positions (avoid overlapping with existing nodes)
-    overrides: dict of node parameter overrides keyed by node alias
+    overrides: parameter overrides keyed by recipe node alias, e.g.
+      {"<alias>": {"intensity": 8.0}} (get_recipe_info lists the aliases)
     """
     return await _async_send("apply_recipe", {
         "recipe_name": recipe_name,
@@ -946,6 +1020,21 @@ async def list_documentation(ctx: Context,
         "action": action,
         "query": query,
     })
+
+
+@mcp.tool(annotations=_UPDATE, structured_output=False)
+async def reload_plugin(ctx: Context, handlers: bool = True) -> str:
+    """
+    Hot-reload the SD MCP plugin's Python code from disk without restarting SD.
+    Development tool: use after editing files in the plugin folder.
+
+    - handlers: also reload the command handlers (plugin __init__.py). False
+      reloads only the recipes, documentation and port-suggestion modules.
+
+    The TCP server and main-thread dispatcher are kept, so changes to those
+    still need an SD restart. Bridge (MCP server) changes need a client restart.
+    """
+    return await _async_send("reload_plugin", {"handlers": handlers})
 
 
 # ---------------------------------------------------------------------------
