@@ -106,29 +106,34 @@ def _recv_framed(sock: socket.socket, timeout: float) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Send command — BUG-B01 fix: lock held only for the socket operation
+# Send command — BUG-B01/B10: lock held only for one connect+send+recv
 # ---------------------------------------------------------------------------
 def _send_command_locked(cmd_type: str, params: dict = None) -> dict:
     """
     Open fresh TCP connection, send one command, receive one response.
     Lock is acquired INSIDE this function for the duration of the socket op.
     This prevents a single timeout from holding the lock for 120+ seconds.
+
+    BUG-B10 fix: the lock now covers connect as well as send/recv. The plugin serves
+    connections one at a time in connect order, so connecting before taking the lock
+    let a waiting call queue up ahead of the lock holder: the plugin waited for the
+    waiting call's request while the lock holder waited for its reply (deadlock
+    until the 120s timeout, seen with parallel tool calls).
     """
     command = {"type": cmd_type, "params": params or {}}
     data_out = json.dumps(command).encode("utf-8")
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(CONNECT_TIMEOUT)
-    try:
-        sock.connect(("localhost", _sd_port))
-    except Exception as e:
-        sock.close()
-        raise ConnectionError(
-            f"Cannot connect to Substance Designer on localhost:{_sd_port}. "
-            f"Is SD running with the MCP plugin loaded? ({e})")
-
-    # Acquire lock AFTER connection is established — only for the send/recv cycle
     with _send_lock:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(CONNECT_TIMEOUT)
+        try:
+            sock.connect(("localhost", _sd_port))
+        except Exception as e:
+            sock.close()
+            raise ConnectionError(
+                f"Cannot connect to Substance Designer on localhost:{_sd_port}. "
+                f"Is SD running with the MCP plugin loaded? ({e})")
+
         try:
             _send_framed(sock, data_out)
             response_bytes = _recv_framed(sock, TIMEOUT)

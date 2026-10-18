@@ -93,6 +93,7 @@ PLUGIN_VERSION    = (3, 4, 0)
 HEADER_SIZE       = 4
 COMMAND_TIMEOUT   = 120
 CLIENT_TIMEOUT    = 130
+REQUEST_TIMEOUT   = 10    # connected clients send their request at once; never let one stall the serial accept loop
 ACCEPT_BACKLOG    = 5
 MAX_MSG_SIZE      = 100 * 1024 * 1024   # 100 MB
 
@@ -574,7 +575,7 @@ class SDMCPServer:
             client.settimeout(CLIENT_TIMEOUT)
             _log("Client on port {}: {}".format(port, addr))
 
-            payload = _recv_framed(client, timeout=CLIENT_TIMEOUT)
+            payload = _recv_framed(client, timeout=REQUEST_TIMEOUT)
             if payload is None:
                 return
 

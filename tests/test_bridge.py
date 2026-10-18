@@ -228,3 +228,37 @@ async def test_reload_plugin_command(fake_sd, client):
     result = await client.call_tool("reload_plugin", {"handlers": False})
     assert not result.isError
     assert fake_sd.received == [{"type": "reload_plugin", "params": {"handlers": False}}]
+
+
+async def test_waiting_call_does_not_hold_a_plugin_connection(fake_sd):
+    """Regression: parallel calls deadlocked until the 120s timeout.
+
+    The plugin serves connections one at a time in connect order. The bridge used
+    to connect *before* taking _send_lock, so a call waiting on the lock already
+    sat in the plugin's accept queue. If a call that connected later got the lock
+    first, the plugin waited for the earlier call's request, which waited for the
+    lock, while the lock holder waited for its reply.
+    """
+    import asyncio
+    import threading
+
+    with bridge._send_lock:
+        # Call A must wait for the lock; it must not connect to SD while waiting.
+        waiting = threading.Thread(target=bridge._request, args=("get_scene_info",), daemon=True)
+        waiting.start()
+        await asyncio.sleep(0.3)
+
+        # Meanwhile the lock holder (this test) talks to SD and must get a reply promptly.
+        def lock_holder_round_trip():
+            with socket.create_connection(("127.0.0.1", fake_sd.port), timeout=2) as s:
+                payload = json.dumps({"type": "get_node_info", "params": {}}).encode()
+                s.sendall(struct.pack(">I", len(payload)) + payload)
+                (length,) = struct.unpack(">I", s.recv(4))
+                return json.loads(s.recv(length))
+
+        reply = await asyncio.to_thread(lock_holder_round_trip)
+        assert reply["status"] == "success"
+
+    await asyncio.to_thread(waiting.join, 5)
+    assert not waiting.is_alive()
+    assert [c["type"] for c in fake_sd.received] == ["get_node_info", "get_scene_info"]
