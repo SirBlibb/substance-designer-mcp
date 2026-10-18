@@ -240,7 +240,7 @@ _ARBITRARY = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
 # If a future version drops injection, remove ctx parameter from all tools.
 # ======================================================================
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def get_scene_info(ctx: Context) -> str:
     """
     Get info about loaded packages and graphs in Substance Designer.
@@ -249,7 +249,7 @@ async def get_scene_info(ctx: Context) -> str:
     return await _async_send("get_scene_info")
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def create_package(ctx: Context) -> str:
     """
     Create a new empty package in Substance Designer.
@@ -258,7 +258,7 @@ async def create_package(ctx: Context) -> str:
     return await _async_send("create_package")
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def create_graph(ctx: Context,
                        package_index: int = 0,
                        graph_name: str = "MCP_Graph",
@@ -279,7 +279,7 @@ async def create_graph(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_DESTRUCTIVE)
+@mcp.tool(annotations=_DESTRUCTIVE, structured_output=False)
 async def delete_graph(ctx: Context,
                        graph_identifier: str,
                        package_index: int = 0) -> str:
@@ -290,13 +290,13 @@ async def delete_graph(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_UPDATE)
+@mcp.tool(annotations=_UPDATE, structured_output=False)
 async def open_graph(ctx: Context, graph_identifier: str) -> str:
     """Open a graph in the Substance Designer UI editor."""
     return await _async_send("open_graph", {"graph_identifier": graph_identifier})
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def get_graph_info(ctx: Context,
                          graph_identifier: Optional[str] = None,
                          node_limit: int = 100,
@@ -317,7 +317,7 @@ async def get_graph_info(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def list_node_definitions(ctx: Context,
                                 filter_text: str = "",
                                 graph_identifier: Optional[str] = None,
@@ -340,7 +340,7 @@ async def list_node_definitions(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def create_node(ctx: Context,
                       definition_id: str,
                       graph_identifier: Optional[str] = None,
@@ -383,7 +383,7 @@ async def create_node(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def create_instance_node(ctx: Context,
                                resource_url: str,
                                graph_identifier: Optional[str] = None,
@@ -406,7 +406,7 @@ async def create_instance_node(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def create_output_node(ctx: Context,
                              usage: str = "baseColor",
                              label: Optional[str] = None,
@@ -427,7 +427,7 @@ async def create_output_node(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def connect_nodes(ctx: Context,
                         from_node_id: str,
                         to_node_id: str,
@@ -471,7 +471,7 @@ async def connect_nodes(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_DESTRUCTIVE)
+@mcp.tool(annotations=_DESTRUCTIVE, structured_output=False)
 async def disconnect_nodes(ctx: Context,
                            node_id: str,
                            input_id: str,
@@ -489,7 +489,7 @@ async def disconnect_nodes(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_UPDATE)
+@mcp.tool(annotations=_UPDATE, structured_output=False)
 async def set_parameter(ctx: Context,
                         node_id: str,
                         parameter_id: str,
@@ -532,7 +532,7 @@ async def set_parameter(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def get_node_info(ctx: Context,
                         node_id: str,
                         graph_identifier: Optional[str] = None) -> str:
@@ -550,7 +550,7 @@ async def get_node_info(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_DESTRUCTIVE)
+@mcp.tool(annotations=_DESTRUCTIVE, structured_output=False)
 async def delete_node(ctx: Context,
                       node_id: str,
                       graph_identifier: Optional[str] = None) -> str:
@@ -565,7 +565,7 @@ async def delete_node(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_UPDATE)
+@mcp.tool(annotations=_UPDATE, structured_output=False)
 async def move_node(ctx: Context,
                     node_id: str,
                     position: List[float],
@@ -585,7 +585,7 @@ async def move_node(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def duplicate_node(ctx: Context,
                          node_id: str,
                          offset: Optional[List[float]] = None,
@@ -606,7 +606,7 @@ async def duplicate_node(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_UPDATE)
+@mcp.tool(annotations=_UPDATE, structured_output=False)
 async def set_graph_output_size(ctx: Context,
                                 width_log2: int = 11,
                                 height_log2: int = 11,
@@ -624,7 +624,7 @@ async def set_graph_output_size(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_DESTRUCTIVE)
+@mcp.tool(annotations=_DESTRUCTIVE, structured_output=False)
 async def save_package(ctx: Context,
                        package_index: int = 0,
                        file_path: Optional[str] = None,
@@ -642,7 +642,7 @@ async def save_package(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def get_library_nodes(ctx: Context,
                             filter_text: str = "",
                             limit: int = 200) -> str:
@@ -661,7 +661,7 @@ async def get_library_nodes(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_UPDATE)
+@mcp.tool(annotations=_UPDATE, structured_output=False)
 async def arrange_nodes(ctx: Context,
                         graph_identifier: Optional[str] = None,
                         start_x: float = -1000,
@@ -687,7 +687,7 @@ async def arrange_nodes(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ARBITRARY)
+@mcp.tool(annotations=_ARBITRARY, structured_output=False)
 async def execute_sd_code(ctx: Context, code: str) -> str:
     """
     Execute arbitrary Python code in Substance Designer's main thread (safe).
@@ -736,7 +736,7 @@ async def capture_3d_view(ctx: Context,
     return content
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def create_batch_graph(ctx: Context,
                              graph_name: str,
                              package_index: int = 0,
@@ -793,7 +793,7 @@ async def create_batch_graph(ctx: Context,
 # Recipe tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def list_recipes(ctx: Context) -> str:
     """
     List all built-in material recipes available in the SD MCP plugin.
@@ -803,7 +803,7 @@ async def list_recipes(ctx: Context) -> str:
     return await _async_send("list_recipes", {})
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def get_recipe_info(ctx: Context, recipe_name: str) -> str:
     """
     Get detailed info about a specific material recipe.
@@ -812,7 +812,7 @@ async def get_recipe_info(ctx: Context, recipe_name: str) -> str:
     return await _async_send("get_recipe_info", {"recipe_name": recipe_name})
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def build_material_graph(ctx: Context,
                                 graph_name: str,
                                 recipe_name: str,
@@ -847,7 +847,7 @@ async def build_material_graph(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def build_heightmap_graph(ctx: Context,
                                  graph_name: str,
                                  style: str,
@@ -880,7 +880,7 @@ async def build_heightmap_graph(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE)
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
 async def apply_recipe(ctx: Context,
                         recipe_name: str,
                         graph_identifier: Optional[str] = None,
@@ -903,7 +903,7 @@ async def apply_recipe(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_READ_ONLY)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
 async def list_documentation(ctx: Context,
                               category: str = "all",
                               filter_text: str = "",
