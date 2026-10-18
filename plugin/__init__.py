@@ -1,5 +1,5 @@
 """
-Substance Designer MCP Plugin v3.3.0
+Substance Designer MCP Plugin v3.4.0
 =====================================
 ARCHITECTURE
 ============
@@ -52,6 +52,7 @@ VERSION HISTORY
   3.1.0 - SD crash fixes (SDValueInt2 on float, SDValueFloat on enum), build_heightmap bug fix
   3.2.x - Reporting bug fix (library node definition field), recipes v5.0 (78 recipes, JP architecture)
   3.3.0 - list_documentation tool: embedded knowledge base for all SD nodes, ports, params, workflows
+  3.4.0 - Port errors list valid port IDs (closest first); reload_plugin hot reload
 """
 
 import sd
@@ -88,7 +89,7 @@ from sd.api.sbs.sdsbscompgraph import SDSBSCompGraph
 
 # ── Configuration ────────────────────────────────────────────────────────────
 DEFAULT_PORTS     = [9881]
-PLUGIN_VERSION    = (3, 3, 0)
+PLUGIN_VERSION    = (3, 4, 0)
 HEADER_SIZE       = 4
 COMMAND_TIMEOUT   = 120
 CLIENT_TIMEOUT    = 130
@@ -212,6 +213,8 @@ BLEND_MODES = {
 
 # ── Globals ──────────────────────────────────────────────────────────────────
 _server = None
+# Submodules reloaded by the reload_plugin command (pure Python, no SD state).
+_RELOADABLE_SUBMODULES = ("recipes", "sd_documentation", "port_suggest")
 _library_cache = {}   # filter_text -> list of {identifier, url, package}
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -739,6 +742,8 @@ class CommandHandler:
             "send_to_3d_view":        self.send_to_3d_view,
             # ── Documentation ──
             "list_documentation":     self.list_documentation,
+            # ── Development ──
+            "reload_plugin":          self.reload_plugin,
         }
         # Library node URL cache (populated lazily, session-lifetime)
         self._lib_url_cache = {}  # lower-case identifier -> url string
@@ -1114,22 +1119,46 @@ class CommandHandler:
                 results[param_id] = "error: {}".format(e)
         return results
 
-    def _safe_connect(self, graph, from_node, from_out, to_node, to_in):
-        """Connect nodes with port validation. Returns True on success."""
-        out_ids = set()
-        in_ids  = set()
+    def _port_ids(self, node, category):
+        """Connectable port IDs of a node, in SD's declaration order.
+
+        Inputs exclude system params ($outputsize, ...) and non-connectable
+        parameters (blendingmode, intensity, ...). Falls back to all non-system
+        IDs if SD reports nothing connectable.
+        """
+        ids, connectable = [], []
         try:
-            for p in list(from_node.getProperties(SDPropertyCategory.Output)):
-                out_ids.add(p.getId())
-        except Exception:
-            pass
-        try:
-            for p in list(to_node.getProperties(SDPropertyCategory.Input)):
+            for p in list(node.getProperties(category)):
                 pid = p.getId()
-                if pid not in _SYSTEM_PARAMS:
-                    in_ids.add(pid)
+                if pid in _SYSTEM_PARAMS:
+                    continue
+                ids.append(pid)
+                try:
+                    if p.isConnectable():
+                        connectable.append(pid)
+                except Exception:
+                    pass
         except Exception:
             pass
+        return connectable or ids
+
+    def _node_label(self, node):
+        try:
+            return "'{}' ({})".format(node.getIdentifier(), self._get_node_def_id(node))
+        except Exception:
+            return "'?'"
+
+    def _safe_connect(self, graph, from_node, from_out, to_node, to_in):
+        """Connect nodes with port validation. Returns True on success.
+
+        Invalid port IDs raise ValueError listing the node's valid port IDs,
+        closest match first (see port_suggest.port_error).
+        """
+        from . import port_suggest
+        out_list = self._port_ids(from_node, SDPropertyCategory.Output)
+        in_list  = self._port_ids(to_node, SDPropertyCategory.Input)
+        out_ids  = set(out_list)
+        in_ids   = set(in_list)
 
         if out_ids and from_out not in out_ids:
             # Library instance nodes expose version-specific output port names
@@ -1149,21 +1178,29 @@ class CommandHandler:
                     from_out, resolved, from_node.getIdentifier()))
                 from_out = resolved
             else:
-                raise ValueError(
-                    "Output port '{}' not found on node '{}'. "
-                    "Available: {}".format(from_out, from_node.getIdentifier(), sorted(out_ids)))
+                raise ValueError(port_suggest.port_error(
+                    "Output", from_out, self._node_label(from_node), out_list,
+                    "Input", self._port_ids(from_node, SDPropertyCategory.Input)))
         if in_ids and to_in not in in_ids:
-            raise ValueError(
-                "Input port '{}' not found on node '{}'. "
-                "Available: {}".format(to_in, to_node.getIdentifier(), sorted(in_ids)))
+            lowered = str(to_in).lower()
+            resolved = next((pid for pid in in_list if pid.lower() == lowered), None)
+            if resolved is not None:
+                _log("Auto-resolved input port '{}' -> '{}' on '{}'".format(
+                    to_in, resolved, to_node.getIdentifier()))
+                to_in = resolved
+            else:
+                raise ValueError(port_suggest.port_error(
+                    "Input", to_in, self._node_label(to_node), in_list,
+                    "Output", self._port_ids(to_node, SDPropertyCategory.Output)))
 
         conn = from_node.newPropertyConnectionFromId(from_out, to_node, to_in)
         if conn is None:
             raise RuntimeError(
-                "Connection failed: {}.{} -> {}.{}".format(
+                "Connection failed: {}.{} -> {}.{}. Output ports of source: {}. "
+                "Input ports of target: {}.".format(
                     from_node.getIdentifier(), from_out,
-                    to_node.getIdentifier(), to_in))
-        return True
+                    to_node.getIdentifier(), to_in, out_list, in_list))
+        return from_out, to_in
 
     # ═══════════════════════════════════════════════════════════════════════
     # ── CORE SCENE TOOLS ────────────────────────────────────────────────
@@ -2285,7 +2322,8 @@ class CommandHandler:
         graph     = self._resolve_graph(graph_identifier)
         from_node = self._find_node(graph, from_node_id)
         to_node   = self._find_node(graph, to_node_id)
-        self._safe_connect(graph, from_node, from_output, to_node, to_input)
+        from_output, to_input = self._safe_connect(
+            graph, from_node, from_output, to_node, to_input)
         return {
             "from_node":   from_node_id,
             "from_output": from_output,
@@ -2347,7 +2385,8 @@ class CommandHandler:
                 except Exception:
                     to_input = "input1"
 
-        self._safe_connect(graph, from_node, from_output, to_node, to_input)
+        from_output, to_input = self._safe_connect(
+            graph, from_node, from_output, to_node, to_input)
         return {
             "from_node":   from_node_id,
             "from_output": from_output,
@@ -2548,17 +2587,20 @@ class CommandHandler:
             ti  = conn.get("to_input", "input1")
 
             if fa not in alias_map:
-                conn_results.append({"error": "from '{}' not found".format(fa), "conn": conn})
+                conn_results.append({"error": "from alias '{}' not found. Known aliases: {}".format(
+                    fa, sorted(alias_map)), "conn": conn})
                 continue
             if ta not in alias_map:
-                conn_results.append({"error": "to '{}' not found".format(ta), "conn": conn})
+                conn_results.append({"error": "to alias '{}' not found. Known aliases: {}".format(
+                    ta, sorted(alias_map)), "conn": conn})
                 continue
 
             fn, _ = alias_map[fa]
             tn, _ = alias_map[ta]
             try:
-                self._safe_connect(graph, fn, fo, tn, ti)
-                conn_results.append({"from": fa, "to": ta, "success": True})
+                fo, ti = self._safe_connect(graph, fn, fo, tn, ti)
+                conn_results.append({"from": fa, "to": ta, "from_output": fo,
+                                     "to_input": ti, "success": True})
             except Exception as e:
                 conn_results.append({"from": fa, "to": ta, "success": False, "error": str(e)})
 
@@ -2825,8 +2867,9 @@ class CommandHandler:
             fn, _ = alias_map[fa]
             tn, _ = alias_map[ta]
             try:
-                self._safe_connect(graph, fn, fo, tn, ti)
-                conn_results.append({"from": fa, "to": ta, "success": True})
+                fo, ti = self._safe_connect(graph, fn, fo, tn, ti)
+                conn_results.append({"from": fa, "to": ta, "from_output": fo,
+                                     "to_input": ti, "success": True})
             except Exception as e:
                 conn_results.append({"from": fa, "to": ta, "success": False, "error": str(e)})
 
@@ -2915,6 +2958,60 @@ class CommandHandler:
             return {"status": "ok", "result": result}
         except Exception as e:
             return {"status": "error", "message": str(e)}
+
+    def reload_plugin(self, handlers=True):
+        """Hot-reload the plugin from disk without restarting SD.
+
+        Always reloads the pure-Python submodules (recipes, sd_documentation,
+        port_suggest). With handlers=True it also re-executes this package's
+        __init__.py and swaps a fresh CommandHandler into the running server.
+        The TCP server, its listener sockets and the Qt invoker are kept (the
+        invoker must stay the one created on the main thread), so the bridge
+        connection is unaffected. Changes to SDMCPServer / the dispatcher
+        themselves still need an SD restart.
+        """
+        pkg_name = __name__
+        pkg = sys.modules[pkg_name]
+        reloaded = []
+        for sub in _RELOADABLE_SUBMODULES:
+            name = pkg_name + "." + sub
+            mod = sys.modules.get(name)
+            if mod is None:
+                _importlib.import_module(name)
+            else:
+                _importlib.reload(mod)
+            reloaded.append(sub)
+
+        result = {"reloaded_modules": reloaded, "handlers_reloaded": False}
+        if not handlers:
+            return result
+
+        # Syntax-check first so a typo leaves the running module untouched.
+        src_path = pkg.__file__
+        with open(src_path, "r", encoding="utf-8") as f:
+            compile(f.read(), src_path, "exec")
+
+        server  = _server
+        invoker = _Invoker._instance
+        try:
+            _importlib.reload(pkg)
+        finally:
+            # reload() re-runs module top-level code, which resets these.
+            pkg._server = server
+            pkg._Invoker._instance = invoker
+
+        new_handler = pkg.CommandHandler()
+        new_handler._lib_url_cache  = self._lib_url_cache
+        new_handler._library_loaded = self._library_loaded
+        if server is not None:
+            server._handler = new_handler
+        _log("Plugin reloaded from {}".format(src_path))
+        result.update({
+            "handlers_reloaded": True,
+            "plugin_version":    ".".join(map(str, pkg.PLUGIN_VERSION)),
+            "commands":          sorted(new_handler.HANDLERS),
+        })
+        return result
 
     def execute_code(self, code):
         """Execute arbitrary Python on the SD main thread. Keep it short."""
