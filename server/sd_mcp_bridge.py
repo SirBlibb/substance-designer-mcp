@@ -312,12 +312,17 @@ def _dump(items) -> list:
 # ======================================================================
 
 @mcp.tool(annotations=_READ_ONLY, structured_output=False)
-async def get_scene_info(ctx: Context) -> str:
+async def get_scene_info(ctx: Context, include_library: bool = False) -> str:
     """
     Get info about loaded packages and graphs in Substance Designer.
     Returns packages, graphs, node counts, current graph, and SD version.
+    Each package has an "index" usable as package_index in other tools.
+
+    - include_library: also list SD's built-in library packages (resources/packages),
+      which SD loads as dependencies of library nodes. Hidden by default; their
+      count is reported as hidden_library_packages.
     """
-    return await _async_send("get_scene_info")
+    return await _async_send("get_scene_info", {"include_library": include_library})
 
 
 @mcp.tool(annotations=_ADDITIVE, structured_output=False)

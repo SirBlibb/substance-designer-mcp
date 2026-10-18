@@ -55,7 +55,7 @@ async def test_tool_call_sends_framed_command_and_returns_json(fake_sd, client):
     fake_sd.handler = lambda t, p: {"status": "success", "result": {"packages": [], "version": "15.1.2"}}
     result = await client.call_tool("get_scene_info", {})
     assert not result.isError
-    assert fake_sd.received == [{"type": "get_scene_info", "params": {}}]
+    assert fake_sd.received == [{"type": "get_scene_info", "params": {"include_library": False}}]
     assert json.loads(_text(result)) == {"packages": [], "version": "15.1.2"}
 
 

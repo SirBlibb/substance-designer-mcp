@@ -331,6 +331,22 @@ def _find_sd_library_dir():
     return None
 
 
+_LIB_DIR_CACHE = []
+
+
+def _is_builtin_package(file_path):
+    """True if file_path is one of SD's own library packages (<SD install>/resources/packages)."""
+    if not file_path:
+        return False
+    if not _LIB_DIR_CACHE:
+        _LIB_DIR_CACHE.append(_find_sd_library_dir())
+    path = os.path.normcase(os.path.normpath(file_path))
+    lib_dir = _LIB_DIR_CACHE[0]
+    if lib_dir:
+        return path.startswith(os.path.normcase(os.path.normpath(lib_dir)) + os.sep)
+    return os.path.normcase(os.path.join('resources', 'packages') + os.sep) in path
+
+
 # ── Recipe param-name compatibility ─────────────────────────────────────────
 # Recipes are authored against upstream library parameter names but SD
 # 15.1.x instance nodes expose renamed properties (perlin: "Distance" +
@@ -1206,7 +1222,7 @@ class CommandHandler:
     # ── CORE SCENE TOOLS ────────────────────────────────────────────────
     # ═══════════════════════════════════════════════════════════════════════
 
-    def get_scene_info(self):
+    def get_scene_info(self, include_library=False):
         pkg_mgr = self._pkg_mgr()
         try:
             current_graph = self._ui_mgr().getCurrentGraph()
@@ -1216,8 +1232,13 @@ class CommandHandler:
             current_graph_id = None
 
         pkg_list = []
-        for pkg in list(pkg_mgr.getUserPackages()):
+        hidden_library = 0
+        for index, pkg in enumerate(list(pkg_mgr.getUserPackages())):
             try:
+                file_path = pkg.getFilePath()
+                if not include_library and _is_builtin_package(file_path):
+                    hidden_library += 1
+                    continue
                 graphs = []
                 for res in list(pkg.getChildrenResources(False)):
                     try:
@@ -1232,9 +1253,10 @@ class CommandHandler:
                         graphs.append({"identifier": rid, "type": cname, "node_count": nc})
                     except Exception:
                         pass
-                pkg_list.append({"file_path": pkg.getFilePath(), "graphs": graphs})
+                # index = position in getUserPackages(), i.e. the package_index other tools take
+                pkg_list.append({"index": index, "file_path": file_path, "graphs": graphs})
             except Exception as e:
-                pkg_list.append({"error": str(e)})
+                pkg_list.append({"index": index, "error": str(e)})
 
         current_nc = 0
         if current_graph is not None:
@@ -1246,6 +1268,7 @@ class CommandHandler:
         return {
             "packages": pkg_list,
             "package_count": len(pkg_list),
+            "hidden_library_packages": hidden_library,
             "current_graph": current_graph_id,
             "current_graph_node_count": current_nc,
             "sd_version": self._get_sd_version(),
