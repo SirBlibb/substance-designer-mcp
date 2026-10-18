@@ -41,7 +41,9 @@ venv_site = os.path.join(script_dir, '.venv', 'Lib', 'site-packages')
 if os.path.exists(venv_site):
     sys.path.insert(0, venv_site)
 
-from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -147,44 +149,36 @@ def _send_command_locked(cmd_type: str, params: dict = None) -> dict:
                 pass
 
 
-def _send(cmd_type: str, params: dict = None) -> str:
+def _request(cmd_type: str, params: dict = None) -> Any:
     """
-    Send with retry for connection errors only.
+    Send one command and return its result.
     BUG-B01 fix: retry loop is OUTSIDE the lock (lock is inside _send_command_locked).
     BUG-B08 clarification: timeouts do NOT retry (would just re-queue a stuck SD op).
-    Returns formatted result string for MCP tool response.
+    BUG-B09 fix: retry ONLY when the TCP connect itself failed (ConnectionError raised
+    before anything was sent). Previously any error message containing "connect"
+    (e.g. a failed connect_nodes) was retried, re-running commands SD had already run.
+    Raises ToolError on failure so MCP clients receive isError=true.
     """
-    last_error = None
     for attempt in range(MAX_RETRIES + 1):
         try:
             response = _send_command_locked(cmd_type, params)
-            if response.get("status") == "error":
-                msg = response.get("message", "Unknown error")
-                # Only retry on connection errors (SD not yet started, transient)
-                is_connect_err = "Cannot connect" in msg or "connect" in msg.lower()
-                if is_connect_err and attempt < MAX_RETRIES:
-                    last_error = msg
-                    logger.warning(f"Attempt {attempt+1} failed (connect): {msg}. Retrying in {RETRY_DELAY}s...")
-                    time.sleep(RETRY_DELAY)
-                    continue
-                # Non-retryable errors (timeout, SD errors, validation) — return immediately
-                return f"Error: {msg}"
-            result = response.get("result")
-            # BUG-B07 fix: None result returns "{}" not "null"
-            if result is None:
-                result = {}
-            return json.dumps(result, indent=2)
+            break
         except ConnectionError as e:
-            last_error = str(e)
             if attempt < MAX_RETRIES:
                 logger.warning(f"Attempt {attempt+1} failed (connection): {e}. Retrying in {RETRY_DELAY}s...")
                 time.sleep(RETRY_DELAY)
                 continue
-            return f"Connection Error: {e}"
-        except Exception as e:
-            logger.error(f"Unexpected error in {cmd_type}: {e}", exc_info=True)
-            return f"Error: {e}"
-    return f"Error: All {MAX_RETRIES+1} attempts failed. Last: {last_error}"
+            raise ToolError(f"Connection Error: {e}") from e
+    if response.get("status") == "error":
+        raise ToolError(response.get("message", "Unknown error"))
+    result = response.get("result")
+    # BUG-B07 fix: None result returns "{}" not "null"
+    return {} if result is None else result
+
+
+def _send(cmd_type: str, params: dict = None) -> str:
+    """Send a command and format its result as JSON text for the MCP tool response."""
+    return json.dumps(_request(cmd_type, params), indent=2)
 
 
 async def _async_send(cmd_type: str, params: dict = None) -> str:
@@ -202,8 +196,42 @@ async def _lifespan(app: FastMCP):
     logger.info("Substance Designer MCP bridge shutting down.")
 
 
+SERVER_INSTRUCTIONS = """\
+Tools for driving a running Adobe Substance 3D Designer (SD) instance.
+SD must be running with the MCP plugin loaded (TCP port 9881); if a tool reports
+a connection error, ask the user to start SD rather than retrying.
+
+Recommended workflow:
+1. Call get_scene_info first to see loaded packages, graphs and the active graph.
+2. Prefer high-level tools over node-by-node building: list_recipes / apply_recipe,
+   build_material_graph, build_heightmap_graph, or create_batch_graph (one call
+   for a whole graph). Fall back to create_node + connect_nodes for small edits.
+3. Port IDs must match exactly. Atomic nodes output "unique_filter_output";
+   library nodes (create_instance_node) have custom port names, so call
+   get_node_info before connecting them. list_documentation(category="port_reference")
+   lists known ports, and list_documentation(action="search", query=...) searches all docs.
+4. To check the result visually, open the 3D view in SD (F3) and call
+   capture_3d_view, which returns the rendered preview as an image. Iterate with
+   set_parameter, then capture again (refresh_first=True if the render looks stale).
+5. Changes are in memory until save_package is called.
+
+execute_sd_code runs arbitrary Python on SD's main thread and freezes SD while it
+runs; use it only when no dedicated tool fits, and keep the code short.
+"""
+
 # BUG-B05 fix: pass lifespan at construction (not post-construction attribute)
-mcp = FastMCP("SubstanceDesignerMCP", lifespan=_lifespan)
+mcp = FastMCP("SubstanceDesignerMCP", instructions=SERVER_INSTRUCTIONS, lifespan=_lifespan)
+
+# Tool annotations (MCP hints; all tools act only on the local SD instance).
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+_ADDITIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                            idempotentHint=False, openWorldHint=False)
+_UPDATE = ToolAnnotations(readOnlyHint=False, destructiveHint=False,
+                          idempotentHint=True, openWorldHint=False)
+_DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                               idempotentHint=True, openWorldHint=False)
+_ARBITRARY = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                             idempotentHint=False, openWorldHint=False)
 
 
 # ======================================================================
@@ -212,7 +240,7 @@ mcp = FastMCP("SubstanceDesignerMCP", lifespan=_lifespan)
 # If a future version drops injection, remove ctx parameter from all tools.
 # ======================================================================
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def get_scene_info(ctx: Context) -> str:
     """
     Get info about loaded packages and graphs in Substance Designer.
@@ -221,7 +249,7 @@ async def get_scene_info(ctx: Context) -> str:
     return await _async_send("get_scene_info")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def create_package(ctx: Context) -> str:
     """
     Create a new empty package in Substance Designer.
@@ -230,7 +258,7 @@ async def create_package(ctx: Context) -> str:
     return await _async_send("create_package")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def create_graph(ctx: Context,
                        package_index: int = 0,
                        graph_name: str = "MCP_Graph",
@@ -251,7 +279,7 @@ async def create_graph(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 async def delete_graph(ctx: Context,
                        graph_identifier: str,
                        package_index: int = 0) -> str:
@@ -262,13 +290,13 @@ async def delete_graph(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_UPDATE)
 async def open_graph(ctx: Context, graph_identifier: str) -> str:
     """Open a graph in the Substance Designer UI editor."""
     return await _async_send("open_graph", {"graph_identifier": graph_identifier})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def get_graph_info(ctx: Context,
                          graph_identifier: Optional[str] = None,
                          node_limit: int = 100,
@@ -289,7 +317,7 @@ async def get_graph_info(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def list_node_definitions(ctx: Context,
                                 filter_text: str = "",
                                 graph_identifier: Optional[str] = None,
@@ -312,7 +340,7 @@ async def list_node_definitions(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def create_node(ctx: Context,
                       definition_id: str,
                       graph_identifier: Optional[str] = None,
@@ -355,7 +383,7 @@ async def create_node(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def create_instance_node(ctx: Context,
                                resource_url: str,
                                graph_identifier: Optional[str] = None,
@@ -378,7 +406,7 @@ async def create_instance_node(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def create_output_node(ctx: Context,
                              usage: str = "baseColor",
                              label: Optional[str] = None,
@@ -399,7 +427,7 @@ async def create_output_node(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def connect_nodes(ctx: Context,
                         from_node_id: str,
                         to_node_id: str,
@@ -443,7 +471,7 @@ async def connect_nodes(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 async def disconnect_nodes(ctx: Context,
                            node_id: str,
                            input_id: str,
@@ -461,7 +489,7 @@ async def disconnect_nodes(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_UPDATE)
 async def set_parameter(ctx: Context,
                         node_id: str,
                         parameter_id: str,
@@ -504,7 +532,7 @@ async def set_parameter(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def get_node_info(ctx: Context,
                         node_id: str,
                         graph_identifier: Optional[str] = None) -> str:
@@ -522,7 +550,7 @@ async def get_node_info(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 async def delete_node(ctx: Context,
                       node_id: str,
                       graph_identifier: Optional[str] = None) -> str:
@@ -537,7 +565,7 @@ async def delete_node(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_UPDATE)
 async def move_node(ctx: Context,
                     node_id: str,
                     position: List[float],
@@ -557,7 +585,7 @@ async def move_node(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def duplicate_node(ctx: Context,
                          node_id: str,
                          offset: Optional[List[float]] = None,
@@ -578,7 +606,7 @@ async def duplicate_node(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_UPDATE)
 async def set_graph_output_size(ctx: Context,
                                 width_log2: int = 11,
                                 height_log2: int = 11,
@@ -596,7 +624,7 @@ async def set_graph_output_size(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 async def save_package(ctx: Context,
                        package_index: int = 0,
                        file_path: Optional[str] = None,
@@ -614,7 +642,7 @@ async def save_package(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def get_library_nodes(ctx: Context,
                             filter_text: str = "",
                             limit: int = 200) -> str:
@@ -633,7 +661,7 @@ async def get_library_nodes(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_UPDATE)
 async def arrange_nodes(ctx: Context,
                         graph_identifier: Optional[str] = None,
                         start_x: float = -1000,
@@ -659,7 +687,7 @@ async def arrange_nodes(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ARBITRARY)
 async def execute_sd_code(ctx: Context, code: str) -> str:
     """
     Execute arbitrary Python code in Substance Designer's main thread (safe).
@@ -672,7 +700,43 @@ async def execute_sd_code(ctx: Context, code: str) -> str:
     return await _async_send("execute_code", {"code": code})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def capture_3d_view(ctx: Context,
+                          output_path: Optional[str] = None,
+                          refresh_first: bool = False,
+                          wait_ms: int = 600,
+                          return_image: bool = True) -> list:
+    """
+    Capture the Substance Designer 3D view (material preview) and return it as an image.
+
+    Lets the agent SEE the rendered material and iterate on parameters:
+    capture -> judge the image -> set_parameter -> capture again.
+    Works even when the SD window is behind other windows (PrintWindow); falls
+    back to briefly raising SD and doing a screen capture.
+
+    - output_path: where to save the PNG (default: %TEMP%/sd_mcp_preview/3dview_<time>.png)
+    - refresh_first: post Space to the 3D viewport before capture; use this if
+      the render looks stale after parameter edits
+    - wait_ms: settle time in ms before capturing (default 600)
+    - return_image: include the PNG in the response (default True); set False to
+      only save the file and get its path
+
+    Returns JSON {path, width, height, method} followed by the image.
+    The 3D view must be open in SD (F3).
+    """
+    result = await asyncio.to_thread(_request, "capture_3d_view", {
+        "output_path": output_path,
+        "refresh_first": refresh_first,
+        "wait_ms": wait_ms,
+    })
+    content: list = [json.dumps(result, indent=2)]
+    path = result.get("path") if isinstance(result, dict) else None
+    if return_image and path and os.path.isfile(path):
+        content.append(Image(path=path))
+    return content
+
+
+@mcp.tool(annotations=_ADDITIVE)
 async def create_batch_graph(ctx: Context,
                              graph_name: str,
                              package_index: int = 0,
@@ -729,7 +793,7 @@ async def create_batch_graph(ctx: Context,
 # Recipe tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def list_recipes(ctx: Context) -> str:
     """
     List all built-in material recipes available in the SD MCP plugin.
@@ -739,7 +803,7 @@ async def list_recipes(ctx: Context) -> str:
     return await _async_send("list_recipes", {})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def get_recipe_info(ctx: Context, recipe_name: str) -> str:
     """
     Get detailed info about a specific material recipe.
@@ -748,7 +812,7 @@ async def get_recipe_info(ctx: Context, recipe_name: str) -> str:
     return await _async_send("get_recipe_info", {"recipe_name": recipe_name})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def build_material_graph(ctx: Context,
                                 graph_name: str,
                                 recipe_name: str,
@@ -783,7 +847,7 @@ async def build_material_graph(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def build_heightmap_graph(ctx: Context,
                                  graph_name: str,
                                  style: str,
@@ -816,7 +880,7 @@ async def build_heightmap_graph(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_ADDITIVE)
 async def apply_recipe(ctx: Context,
                         recipe_name: str,
                         graph_identifier: Optional[str] = None,
@@ -839,7 +903,7 @@ async def apply_recipe(ctx: Context,
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def list_documentation(ctx: Context,
                               category: str = "all",
                               filter_text: str = "",

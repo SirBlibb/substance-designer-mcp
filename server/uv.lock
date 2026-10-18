@@ -634,7 +634,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", extras = ["cli"], specifier = ">=1.4.1" }]
+requires-dist = [{ name = "mcp", extras = ["cli"], specifier = ">=1.10.0" }]
 
 [[package]]
 name = "typer"
