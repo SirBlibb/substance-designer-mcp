@@ -6,3 +6,15 @@ requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.10.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["../tests"]
+pythonpath = ["."]
+markers = [
+    "live: needs a running Substance Designer with the MCP plugin on localhost:9881 (skipped when the port is closed)",
+]
