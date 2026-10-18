@@ -58,11 +58,19 @@ Copy the `plugin/` folder contents to your SD user scripts directory:
 The directory must contain:
 ```
 sd_mcp_plugin/
-├── __init__.py    ← main plugin (TCP listener, all MCP tools)
-└── recipes.py     ← 79 material recipes
+├── __init__.py          ← main plugin (TCP listener, all command handlers)
+├── recipes.py           ← 79 material recipes
+├── sd_documentation.py  ← embedded docs served by list_documentation
+└── port_suggest.py      ← port-ID suggestions for connection errors
 ```
 
 SD auto-loads all plugins from `sduserplugins/` on startup. No additional configuration needed.
+
+**For plugin development**, link the folder instead of copying it so edits in the repo are
+live on disk, then call the `reload_plugin` tool to pick them up without restarting SD:
+```
+mklink /J "%USERPROFILE%\Documents\Adobe\Adobe Substance 3D Designer\python\sduserplugins\sd_mcp_plugin" "C:\PATH\TO\substance-designer-mcp\plugin"
+```
 
 ### Step 2 — Install the Bridge Server
 
@@ -73,7 +81,7 @@ uv sync   # installs mcp[cli] into .venv
 
 Or with pip:
 ```bash
-pip install "mcp[cli]>=1.4.1"
+pip install "mcp[cli]>=1.10.0"
 ```
 
 ### Step 3 — Configure Your MCP Client
@@ -128,23 +136,31 @@ List all available material recipes
 | Tool | Description |
 |------|-------------|
 | `get_scene_info` | List all open packages and graphs |
+| `create_package` | Create a new empty package |
 | `create_graph` | Create a new compositing graph |
 | `get_graph_info` | Get all nodes and connections in a graph |
 | `list_node_definitions` | Search available node types |
 | `create_node` | Create an atomic node (blend, levels, blur, etc.) |
 | `create_instance_node` | Create a library node (Clouds, Cells, Perlin, etc.) |
 | `create_output_node` | Create a PBR output (baseColor, normal, height, etc.) |
-| `connect_nodes` | Connect two nodes via their ports |
+| `connect_nodes` | Connect two nodes via their ports (wrong port IDs fail with the valid IDs, closest match first) |
 | `disconnect_nodes` | Remove a connection |
 | `set_parameter` | Set a node parameter |
 | `get_node_info` | Get ports and parameters of a node |
 | `delete_node` | Delete a node |
 | `move_node` | Reposition a node |
+| `arrange_nodes` | Grid-layout all nodes (destroys connections in SD 15) |
 | `duplicate_node` | Duplicate an atomic node |
+| `get_library_nodes` | Search library nodes and their `pkg://` URLs |
+| `set_graph_output_size` | Set graph resolution |
 | `delete_graph` | Delete a graph from a package |
 | `open_graph` | Open a graph in the SD editor |
 | `save_package` | Save the package to disk |
+| `capture_3d_view` | Return the SD 3D view as an image (to judge the material visually) |
+| `list_documentation` | Browse/search the embedded SD knowledge base (nodes, ports, blend modes) |
 | `execute_sd_code` | Execute arbitrary Python in SD's context |
+| `reload_plugin` | Hot-reload the plugin's Python code from disk (development) |
+| **`create_batch_graph`** | **Build a whole graph (nodes + connections) in one call** |
 | **`build_material_graph`** | **Build a full PBR material in one call** |
 | **`build_heightmap_graph`** | **Build a heightmap-only graph in one call** |
 | **`list_recipes`** | **List all 79 available material recipes** |
@@ -177,6 +193,41 @@ build_heightmap_graph(graph_name="CliffHM", style="cliff", detail_level=3, scale
 
 **Heightmap styles:**
 `cliff`, `rock`, `sand`, `cracked`, `mud`, `mountain`, `cobblestone`, `terrain`
+
+### Batch graphs
+
+`create_batch_graph` takes typed node and connection lists (the fields are documented in
+the tool's input schema):
+
+```python
+create_batch_graph(
+    graph_name="NoiseHeight",
+    nodes=[
+        {"id_alias": "noise", "library_keyword": "perlin_noise", "position": [0, 0]},
+        {"id_alias": "blur", "definition_id": "sbs::compositing::blur", "position": [200, 0],
+         "parameters": {"intensity": 4.0}},
+        {"id_alias": "height", "definition_id": "sbs::compositing::output",
+         "usage": "height", "label": "Height", "position": [400, 0]},
+    ],
+    connections=[
+        {"from": "noise", "to": "blur"},  # from_output defaults to unique_filter_output
+        {"from": "blur", "to": "height", "to_input": "inputNodeOutput"},
+    ],
+)
+```
+
+Node fields: `id_alias`, `definition_id` (atomic) or `resource_url` / `library_keyword`
+(library), `position`, `usage` + `label` (output nodes), `parameters`
+(`{"id": value}` or `{"id": {"value": ..., "type": "int2"}}`).
+Connection fields: `from`, `to`, `from_output`, `to_input`.
+
+Every connection is validated against the node's real ports. A wrong ID fails only that
+connection, and the error lists the node's valid port IDs, closest match first:
+
+```
+Input port 'input1' not found on node '1584398761' (sbs::compositing::output).
+Did you mean 'inputNodeOutput'? Valid input port IDs (closest first): ['inputNodeOutput'].
+```
 
 ---
 
@@ -235,6 +286,26 @@ These are hard constraints of the SD 15.x API — violating them hangs or crashe
 
 **Plugin not loading:**
 - Delete `__pycache__/` in the plugin directory and restart SD.
+
+**Plugin edits not picked up:**
+- Call `reload_plugin` (reloads recipes, docs and command handlers). Changes to the TCP
+  server or main-thread dispatcher still need an SD restart; bridge changes need a restart
+  of your AI client.
+
+---
+
+## Development
+
+Tests run the bridge in-process against a fake SD plugin (length-prefixed JSON over TCP),
+so they need no Substance Designer:
+
+```bash
+cd server/
+uv run pytest
+```
+
+Tests marked `live` talk to a real SD on `localhost:9881` and are skipped automatically
+when that port is closed (they are read-only). Run only those with `uv run pytest -m live`.
 
 ---
 

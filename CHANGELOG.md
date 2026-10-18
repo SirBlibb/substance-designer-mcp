@@ -4,6 +4,24 @@ All notable changes to the Substance Designer MCP Plugin are documented here.
 
 ---
 
+## [Unreleased]
+
+### Plugin (v3.4.0)
+- Invalid port IDs in `connect_nodes` / batch connections now fail with the node's valid
+  connectable port IDs, closest match first (`port_suggest.py`); input IDs are matched
+  case-insensitively; unknown batch aliases list the known aliases
+- `reload_plugin` command: hot-reloads recipes, documentation and the command handlers
+  without restarting SD (keeps the TCP server and Qt invoker)
+
+### Bridge
+- `create_batch_graph` nodes/connections and recipe `overrides` are typed (Pydantic), so
+  the MCP input schema documents every field; the wire format to the plugin is unchanged
+- New `reload_plugin` tool
+- Pytest suite (`cd server && uv run pytest`) against a fake SD server; `live` tests run
+  only when SD listens on 9881. Replaces the old hardcoded-path test scripts
+
+---
+
 ## [1.0.0] — 2026-02-19 — First Public Release
 
 ### Plugin (v3.1.0)
