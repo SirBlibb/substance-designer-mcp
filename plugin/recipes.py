@@ -155,11 +155,11 @@ def _pbr_chain(height_alias, base_color_rgb=(0.5, 0.5, 0.5), roughness=0.7, meta
             "levelouthigh": [rh,  rh,  rh,  rh],
         }},
         {"id_alias": "out_roughness", "definition_id": "sbs::compositing::output",  "usage": "roughness",         "label": "Roughness",         "position": [2600, -320]},
-        # AO: recessed areas (low height) = dark; clamp input to lower half so AO is meaningful
+        # AO: recessed areas (low height) = slightly dark; never fully black
         {"id_alias": "pbr_ao",        "definition_id": "sbs::compositing::levels",   "position": [2400, -480],     "parameters": {
-            "levelinlow":   [0.0, 0.0, 0.0, 0.0],
-            "levelinhigh":  [0.6, 0.6, 0.6, 0.6],
-            "leveloutlow":  [0.0, 0.0, 0.0, 0.0],
+            "levelinlow":   [0.1, 0.1, 0.1, 0.1],
+            "levelinhigh":  [0.9, 0.9, 0.9, 0.9],
+            "leveloutlow":  [0.35, 0.35, 0.35, 0.35],
             "levelouthigh": [1.0, 1.0, 1.0, 1.0],
         }},
         {"id_alias": "out_ao",        "definition_id": "sbs::compositing::output",  "usage": "ambientOcclusion",  "label": "Ambient Occlusion", "position": [2600, -480]},

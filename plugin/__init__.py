@@ -270,6 +270,79 @@ def _inject_sd_pyside_path():
 
 _pyside_path = _inject_sd_pyside_path()
 
+
+# ── SD library package auto-loading ─────────────────────────────────────────
+# SD ships its library node sources as loose .sbs packages under
+# '<SD install>/resources/packages'. They are not loaded into the package
+# manager until something instantiates them, so recipe pkg:/// URLs fail on a
+# fresh session (and their ?dependency= hashes drift between SD versions).
+# We load the packages the recipes need once, then resolve by identifier.
+_LIBRARY_SOURCE_FILES = (
+    "perlin_noise_1.sbs",
+    "cells_1.sbs", "cells_2.sbs", "cells_4.sbs",
+    "clouds_1.sbs", "clouds_2.sbs",
+    "crystal_1.sbs", "polygon_2.sbs",
+    "gradient_linear_1.sbs", "gradient_axial.sbs",
+    "blur_hq.sbs", "slope_blur.sbs", "non_uniform_blur.sbs",
+    "multi_directional_warp.sbs", "invert.sbs", "highpass.sbs",
+    "histogram_scan.sbs", "edge_detect.sbs",
+    "flood_fill_2.sbs", "tile_random.sbs",
+)
+
+
+def _find_sd_library_dir():
+    """Locate '<SD install>/resources/packages'."""
+    candidates = []
+    try:
+        exe_dir = os.path.dirname(sys.executable)
+        for _ in range(5):
+            candidates.append(exe_dir)
+            exe_dir = os.path.dirname(exe_dir)
+    except Exception:
+        pass
+    try:
+        import psutil
+        for proc in psutil.process_iter(['name', 'exe']):
+            name = (proc.info.get('name') or '').lower()
+            if 'substance' in name and 'designer' in name:
+                exe = proc.info.get('exe') or ''
+                if exe:
+                    candidates.append(os.path.dirname(exe))
+    except Exception:
+        pass
+    try:
+        for drive in ('C:', 'D:', 'E:', 'F:'):
+            for base in (drive + '\\Program Files\\Adobe',
+                         drive + '\\Program Files (x86)\\Adobe'):
+                if not os.path.isdir(base):
+                    continue
+                for item in os.listdir(base):
+                    if 'substance' in item.lower() and 'designer' in item.lower():
+                        candidates.append(os.path.join(base, item))
+    except Exception:
+        pass
+    for root in candidates:
+        lib_dir = os.path.join(root, 'resources', 'packages')
+        if os.path.isdir(lib_dir):
+            return lib_dir
+    return None
+
+
+# ── Recipe param-name compatibility ─────────────────────────────────────────
+# Recipes are authored against upstream library parameter names but SD
+# 15.1.x instance nodes expose renamed properties (perlin: "Distance" +
+# "Disorder" instead of "scale" + "disorder"; Disorder is 0-100 not 0-1).
+# _set_node_params and set_parameter resolve ids via: exact id ->
+# case-insensitive id -> these aliases (value_factor rescales 0-1 values).
+_PARAM_ID_ALIASES = {
+    "scale":    ("Distance",),
+    "disorder": ("Disorder",),
+}
+_PARAM_VALUE_SCALE = {
+    ("disorder", "Disorder"): 100.0,
+}
+
+
 _QTimer = None
 _QT_BINDING_USED = None
 for _qt_binding in ("PySide6.QtCore", "PySide2.QtCore"):
@@ -662,11 +735,14 @@ class CommandHandler:
             "smart_connect":          self.smart_connect,
             "arrange_nodes":          self.arrange_nodes,
             "execute_code":           self.execute_code,
+            "capture_3d_view":        self.capture_3d_view,
+            "send_to_3d_view":        self.send_to_3d_view,
             # ── Documentation ──
             "list_documentation":     self.list_documentation,
         }
         # Library node URL cache (populated lazily, session-lifetime)
         self._lib_url_cache = {}  # lower-case identifier -> url string
+        self._library_loaded = False
 
     def dispatch(self, cmd_type, params):
         handler = self.HANDLERS.get(cmd_type)
@@ -816,6 +892,7 @@ class CommandHandler:
         key = keyword.lower()
         if key in self._lib_url_cache:
             return self._lib_url_cache[key]
+        self._ensure_library_loaded()
         for pkg in list(self._pkg_mgr().getPackages()):
             try:
                 fp = pkg.getFilePath()
@@ -851,6 +928,81 @@ class CommandHandler:
                 pass
         return None
 
+    def _ensure_library_loaded(self):
+        """Load SD library .sbs packages once so pkg:/// URLs can resolve."""
+        if getattr(self, "_library_loaded", False):
+            return
+        self._library_loaded = True
+        lib_dir = _find_sd_library_dir()
+        if not lib_dir:
+            _log("Library dir not found - library nodes unavailable")
+            return
+        loaded = 0
+        for fname in _LIBRARY_SOURCE_FILES:
+            path = os.path.join(lib_dir, fname)
+            if not os.path.isfile(path):
+                continue
+            try:
+                self._pkg_mgr().loadUserPackage(path)
+                loaded += 1
+            except Exception as e:
+                _log("Library load failed for {}: {}".format(fname, e))
+        _log("Loaded {} library packages from {}".format(loaded, lib_dir))
+
+    def _find_resource_by_url(self, url):
+        """Return the resource matching an exact pkg:/// URL, or None."""
+        for pkg in list(self._pkg_mgr().getPackages()):
+            try:
+                r = pkg.findResourceFromUrl(url)
+                if r is not None:
+                    return r
+            except Exception:
+                pass
+        return None
+
+    def _find_lib_resource(self, identifier):
+        """Find a loaded compgraph resource by identifier (exact, then prefix)."""
+        idl = identifier.lower()
+        fallback = None
+        for pkg in list(self._pkg_mgr().getPackages()):
+            try:
+                for res in list(pkg.getChildrenResources(True)):
+                    try:
+                        if "SDSBSCompGraph" not in res.getClassName():
+                            continue
+                        rid = res.getIdentifier().lower()
+                        if rid == idl:
+                            return res
+                        if fallback is None and (idl in rid or rid in idl):
+                            fallback = res
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return fallback
+
+    def _resolve_res_url(self, url):
+        """Resolve a pkg:/// URL: exact match, then auto-load library packages,
+        then fall back to identifier lookup (handles stale dependency hashes)."""
+        res = self._find_resource_by_url(url)
+        if res is not None:
+            return res, url
+        self._ensure_library_loaded()
+        res = self._find_resource_by_url(url)
+        if res is not None:
+            return res, url
+        ident = url.split("pkg:///")[-1].split("?")[0].strip("/")
+        if ident:
+            res = self._find_lib_resource(ident)
+            if res is not None:
+                try:
+                    new_url = res.getUrl()
+                except Exception:
+                    new_url = url
+                _log("Resolved '{}' -> '{}'".format(url, new_url))
+                return res, new_url
+        return None, url
+
     def _create_library_node(self, graph, keyword, position=None):
         """Create a library node from a keyword, auto-resolving URL."""
         url = self._resolve_lib_url(keyword)
@@ -858,15 +1010,7 @@ class CommandHandler:
             raise ValueError(
                 "Library node '{}' not found. "
                 "Use get_library_nodes(filter_text='{}') to verify.".format(keyword, keyword))
-        resource = None
-        for pkg in list(self._pkg_mgr().getPackages()):
-            try:
-                r = pkg.findResourceFromUrl(url)
-                if r is not None:
-                    resource = r
-                    break
-            except Exception:
-                pass
+        resource, _resolved = self._resolve_res_url(url)
         if not resource:
             raise ValueError("Resource URL not found: {}".format(url))
         node = graph.newInstanceNode(resource)
@@ -875,6 +1019,22 @@ class CommandHandler:
         if position and len(position) >= 2:
             node.setPosition(float2(float(position[0]), float(position[1])))
         return node
+
+    def _resolve_param_id(self, param_id, input_type_map, annot_type_map):
+        """Map a recipe-style parameter id to the actual SD property id for a
+        node. Returns (resolved_id, value_factor, renamed)."""
+        all_ids = set(input_type_map) | set(annot_type_map)
+        if param_id in all_ids:
+            return param_id, 1.0, False
+        lowered = str(param_id).lower()
+        for pid in all_ids:
+            if pid.lower() == lowered:
+                factor = _PARAM_VALUE_SCALE.get((lowered, pid), 1.0)
+                return pid, factor, True
+        for alias in _PARAM_ID_ALIASES.get(lowered, ()):
+            if alias in all_ids:
+                return alias, _PARAM_VALUE_SCALE.get((lowered, alias), 1.0), True
+        return param_id, 1.0, False
 
     def _set_node_params(self, node, params):
         """Apply parameter dict to a node. Type-safe: reads actual SD property type
@@ -920,25 +1080,35 @@ class CommandHandler:
                     pval  = param_spec
                     ptype = _infer_type(pval)
 
+                # Resolve recipe-style ids to real SD property ids on this node
+                resolved_id, value_factor, renamed = self._resolve_param_id(
+                    param_id, input_type_map, annot_type_map)
+                if value_factor != 1.0 and isinstance(pval, (int, float)) \
+                        and abs(pval) <= 1.0:
+                    pval = pval * value_factor
+
                 # Coerce ptype to match actual SD property type (prevents silent crash)
-                sd_type_id = (input_type_map.get(param_id)
-                              or annot_type_map.get(param_id) or "")
+                sd_type_id = (input_type_map.get(resolved_id)
+                              or annot_type_map.get(resolved_id) or "")
                 ptype = _coerce_type(ptype, pval, sd_type_id)
 
                 sd_val = self._make_sd_value(ptype, pval)
                 set_ok = False
-                if param_id in input_type_map:
+                if resolved_id in input_type_map:
                     try:
-                        node.setInputPropertyValueFromId(param_id, sd_val)
+                        node.setInputPropertyValueFromId(resolved_id, sd_val)
                         set_ok = True
                     except Exception:
                         pass
-                if not set_ok and param_id in annot_type_map:
+                if not set_ok and resolved_id in annot_type_map:
                     try:
-                        node.setAnnotationPropertyValueFromId(param_id, sd_val)
+                        node.setAnnotationPropertyValueFromId(resolved_id, sd_val)
                         set_ok = True
                     except Exception:
                         pass
+                if set_ok and renamed:
+                    _log("Param '{}' -> '{}' on '{}'".format(
+                        param_id, resolved_id, node.getIdentifier()))
                 results[param_id] = "ok" if set_ok else "skipped"
             except Exception as e:
                 results[param_id] = "error: {}".format(e)
@@ -962,9 +1132,26 @@ class CommandHandler:
             pass
 
         if out_ids and from_out not in out_ids:
-            raise ValueError(
-                "Output port '{}' not found on node '{}'. "
-                "Available: {}".format(from_out, from_node.getIdentifier(), sorted(out_ids)))
+            # Library instance nodes expose version-specific output port names
+            # (e.g. 'Noise_Zoom' instead of 'output' in SD 15.1.x). Auto-resolve
+            # when there is exactly one output or a case-insensitive match.
+            resolved = None
+            if len(out_ids) == 1:
+                resolved = next(iter(out_ids))
+            else:
+                lowered = str(from_out).lower()
+                for pid in out_ids:
+                    if pid.lower() == lowered:
+                        resolved = pid
+                        break
+            if resolved is not None:
+                _log("Auto-resolved output port '{}' -> '{}' on '{}'".format(
+                    from_out, resolved, from_node.getIdentifier()))
+                from_out = resolved
+            else:
+                raise ValueError(
+                    "Output port '{}' not found on node '{}'. "
+                    "Available: {}".format(from_out, from_node.getIdentifier(), sorted(out_ids)))
         if in_ids and to_in not in in_ids:
             raise ValueError(
                 "Input port '{}' not found on node '{}'. "
@@ -1177,6 +1364,556 @@ class CommandHandler:
                 pass
         return snapshot
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── 3D VIEW CAPTURE ─────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def capture_3d_view(self, output_path=None, refresh_first=False, wait_ms=600):
+        """Capture the 3D viewport (material preview) to a PNG file.
+
+        Lets an agent SEE the rendered material and iterate. Works even when
+        the SD window is occluded (PrintWindow render); falls back to briefly
+        raising SD and doing a screen grab when needed.
+
+        - output_path: target PNG (default %TEMP%/sd_mcp_preview/3dview_<ts>.png)
+        - refresh_first: post a Space key to the viewport first (re-render nudge)
+        - wait_ms: settle time before capture
+        Returns {path, width, height, method}.
+        """
+        import ctypes
+        import time as _time
+        from ctypes import wintypes as _wt
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtGui import QGuiApplication, QKeyEvent, QImage
+        from PySide6.QtCore import QTimer, QPoint, Qt, QEvent, QEventLoop
+
+        app = QApplication.instance()
+        if app is None:
+            raise RuntimeError("Qt application not available.")
+
+        viewport = None
+        for w in app.allWidgets():
+            try:
+                if "ViewportWidget" in w.metaObject().className() and w.width() > 100:
+                    viewport = w
+                    break
+            except Exception:
+                pass
+        if viewport is None:
+            raise RuntimeError(
+                "3D viewport widget not found. Open the 3D view (F3) in SD first.")
+
+        def _pump(ms):
+            loop = QEventLoop()
+            QTimer.singleShot(int(ms), loop.quit)
+            loop.exec()
+
+        if refresh_first:
+            try:
+                for et in (QEvent.KeyPress, QEvent.KeyRelease):
+                    app.postEvent(viewport, QKeyEvent(et, Qt.Key_Space, Qt.NoModifier))
+            except Exception:
+                pass
+        _pump(max(0, int(wait_ms)))
+
+        if not output_path:
+            out_dir = os.path.join(os.environ.get("TEMP", "."), "sd_mcp_preview")
+            output_path = os.path.join(
+                out_dir, "3dview_{}.png".format(_time.strftime("%Y%m%d_%H%M%S")))
+        output_path = os.path.abspath(output_path)
+        out_dir = os.path.dirname(output_path)
+        if out_dir and not os.path.isdir(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+
+        def _nonblack(qimg):
+            try:
+                for gx in range(1, 8):
+                    for gy in range(1, 8):
+                        c = qimg.pixelColor(int(qimg.width() * gx / 8.0),
+                                            int(qimg.height() * gy / 8.0))
+                        if c.red() > 8 or c.green() > 8 or c.blue() > 8:
+                            return True
+            except Exception:
+                return True
+            return False
+
+        # ── method 1: PrintWindow (occlusion-proof) ──
+        try:
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+            mainwin = viewport.window()
+            hwnd = int(mainwin.winId())
+            rect = _wt.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            ww = rect.right - rect.left
+            hh = rect.bottom - rect.top
+            if ww > 0 and hh > 0:
+                hdc = user32.GetWindowDC(hwnd)
+                mdc = gdi32.CreateCompatibleDC(hdc)
+                bmp = gdi32.CreateCompatibleBitmap(hdc, ww, hh)
+                gdi32.SelectObject(mdc, bmp)
+                ok = user32.PrintWindow(hwnd, mdc, 2)
+
+                class _BMIH(ctypes.Structure):
+                    _fields_ = [("biSize", _wt.DWORD), ("biWidth", _wt.LONG),
+                                ("biHeight", _wt.LONG), ("biPlanes", _wt.WORD),
+                                ("biBitCount", _wt.WORD),
+                                ("biCompression", _wt.DWORD),
+                                ("biSizeImage", _wt.DWORD),
+                                ("biXPelsPerMeter", _wt.LONG),
+                                ("biYPelsPerMeter", _wt.LONG),
+                                ("biClrUsed", _wt.DWORD),
+                                ("biClrImportant", _wt.DWORD)]
+                bi = _BMIH()
+                bi.biSize = ctypes.sizeof(_BMIH)
+                bi.biWidth = ww
+                bi.biHeight = -hh
+                bi.biPlanes = 1
+                bi.biBitCount = 32
+                buf = ctypes.create_string_buffer(ww * hh * 4)
+                rows = gdi32.GetDIBits(mdc, bmp, 0, hh, buf,
+                                       ctypes.byref(bi), 0)
+                gdi32.DeleteObject(bmp)
+                gdi32.DeleteDC(mdc)
+                user32.ReleaseDC(hwnd, hdc)
+
+                if ok and rows:
+                    img = QImage(bytes(buf), ww, hh, ww * 4,
+                                 QImage.Format_RGB32)
+                    gpt = viewport.mapToGlobal(QPoint(0, 0))
+                    dpr = mainwin.devicePixelRatio() or 1.0
+                    px = int(round(gpt.x() * dpr - rect.left))
+                    py = int(round(gpt.y() * dpr - rect.top))
+                    pw = int(round(viewport.width() * dpr))
+                    ph = int(round(viewport.height() * dpr))
+                    vp = img.copy(px, py, pw, ph)
+                    if not vp.isNull() and _nonblack(vp):
+                        if vp.save(output_path):
+                            return {"path": output_path,
+                                    "width": vp.width(),
+                                    "height": vp.height(),
+                                    "method": "printwindow"}
+        except Exception:
+            pass
+
+        # ── method 2: screen grab (briefly raises SD) ──
+        try:
+            user32 = ctypes.windll.user32
+            k32 = ctypes.windll.kernel32
+            mainwin = viewport.window()
+            hwnd = int(mainwin.winId())
+            user32.ShowWindow(hwnd, 9)
+            fg = user32.GetForegroundWindow()
+            tid_fg = user32.GetWindowThreadProcessId(fg, None)
+            tid_my = k32.GetCurrentThreadId()
+            user32.AttachThreadInput(tid_my, tid_fg, True)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.AttachThreadInput(tid_my, tid_fg, False)
+            _pump(400)
+            gpt = viewport.mapToGlobal(QPoint(0, 0))
+            scr = QGuiApplication.screenAt(gpt) or QGuiApplication.primaryScreen()
+            pix = scr.grabWindow(0, gpt.x(), gpt.y(),
+                                 viewport.width(), viewport.height())
+            if not pix.isNull() and _nonblack(pix.toImage()):
+                if pix.save(output_path):
+                    return {"path": output_path,
+                            "width": pix.width(),
+                            "height": pix.height(),
+                            "method": "screengrab",
+                            "note": "SD window was briefly raised to capture"}
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "3D view capture failed (PrintWindow produced no content and "
+            "screen grab failed). Make sure the 3D view is open and SD is visible.")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── 3D VIEW MATERIAL BINDING ────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # Menu text for each material channel of the 3D view material, keyed by
+    # normalized label/usage (lowercase, no spaces/underscores).
+    _CHANNEL_TEXT = {
+        "basecolor": "Base Color",
+        "height": "Height",
+        "normal": "Normal",
+        "roughness": "Roughness",
+        "metallic": "Metallic",
+        "ao": "Ambient Occlusion",
+        "ambientocclusion": "Ambient Occlusion",
+        "emissive": "Emissive",
+        "opacity": "Opacity",
+        "specularlevel": "Specular Level",
+        "ior": "IOR",
+        "coatcolor": "Coat Color",
+        "coatroughness": "Coat Roughness",
+        "coatnormal": "Coat Normal",
+        "coatopacity": "Coat Opacity",
+        "coatspecularlevel": "Coat Specular Level",
+        "anisotropyangle": "Anisotropy Angle",
+        "anisotropylevel": "Anisotropy Level",
+        "translucency": "Translucency",
+        "heencolor": "Sheen Color",
+        "sheencolor": "Sheen Color",
+        "sheenroughness": "Sheen Roughness",
+        "dispersion": "Dispersion",
+        "absorptioncolor": "Absorption Color",
+        "absorptiondistance": "Absorption Distance",
+        "scatteringcolor": "Scattering Color",
+    }
+
+    def send_to_3d_view(self, graph_identifier, channels=None):
+        """Bind a graph's outputs to the 3D view material channels.
+
+        The 3D view does NOT follow the active editor tab; what it renders is
+        a persistent material whose channels are assigned per OUTPUT NODE via
+        the graph editor: right-click the node -> "View In 3D View" -> pick the
+        material channel (Base Color, Normal, Roughness, Metallic, Ambient
+        Occlusion, Height, ...). This handler automates that whole flow using
+        real mouse input (SD's graph menus only commit on real clicks).
+
+        Channel per output is derived from the output node's label (e.g.
+        'Base Color', 'Normal'). Use `channels` to override, keyed by output
+        node identifier or label, valued with the menu channel name.
+
+        Once bound the link is LIVE: every set_parameter edit re-renders the
+        view automatically. Loop: send_to_3d_view -> capture_3d_view ->
+        set_parameter -> capture_3d_view ...
+
+        The chain runs in the background via QTimer (SD's main thread is
+        briefly busy between cycles -- roughly 3-6 s per channel, and the
+        cursor is moved while it runs; it is restored at the end). Wait about
+        (channels x 6) seconds before capturing.
+
+        - graph_identifier: graph name as shown in the Explorer (e.g. 'Test_Steel')
+        - channels: optional dict {node_id_or_label: channel_text}
+        Returns {scheduled: True, graph, targets: [{node, channel}...], note}.
+        """
+        import os as _os
+        import tempfile as _tempfile
+        import time as _time
+        import ctypes as _ctypes
+        import ctypes.wintypes as _wt
+        from PySide6.QtWidgets import QApplication, QMenu
+        from PySide6.QtCore import QTimer, QPoint
+        from PySide6.QtGui import QCursor
+        from sd.api.sdproperty import SDPropertyCategory
+
+        app = QApplication.instance()
+        if app is None:
+            raise RuntimeError("Qt application not available.")
+
+        graph = self._resolve_graph(graph_identifier)
+        if graph is None:
+            raise ValueError("Graph '{}' not found.".format(graph_identifier))
+
+        def _norm(s):
+            return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+        # ── Build the (output node, channel) work list ────────────────────
+        out_nodes = []
+        try:
+            arr = graph.getOutputNodes()
+            for i in range(arr.getSize()):
+                out_nodes.append(arr.getItem(i))
+        except Exception:
+            for nd in graph.getNodes():
+                try:
+                    if nd.getDefinition().getId() == "sbs::compositing::output":
+                        out_nodes.append(nd)
+                except Exception:
+                    pass
+        if not out_nodes:
+            raise ValueError(
+                "Graph '{}' has no output nodes.".format(graph_identifier))
+
+        overrides = dict(channels or {})
+        targets = []
+        skipped = []
+        for nd in out_nodes:
+            nid = nd.getIdentifier()
+            label = ""
+            try:
+                v = nd.getPropertyValueFromId("label", SDPropertyCategory.Annotation)
+                if v is not None:
+                    label = v.get() or ""
+            except Exception:
+                label = ""
+            chan = overrides.get(nid)
+            if chan is None and label:
+                chan = overrides.get(label)
+            if chan is None:
+                chan = self._CHANNEL_TEXT.get(_norm(label))
+            if not chan:
+                skipped.append({"node": nid, "label": label,
+                                "reason": "no channel mapping (label empty or unknown); pass 'channels' override"})
+                continue
+            targets.append({"node": nid, "channel": chan, "obj": nd})
+        if not targets:
+            raise ValueError(
+                "No bindable outputs (labels: {}). Provide 'channels' override."
+                .format([s.get("label") for s in skipped]))
+        skipped_nodes = [s for s in skipped]
+
+        # ── Log file for diagnostics ──────────────────────────────────────
+        log_dir = _os.path.join(_tempfile.gettempdir(), "sd_mcp_preview")
+        try:
+            _os.makedirs(log_dir, exist_ok=True)
+        except Exception:
+            pass
+        log_path = _os.path.join(log_dir, "send3d_log.txt")
+        _logf = open(log_path, "a", encoding="utf-8")
+
+        def _log(msg):
+            try:
+                _logf.write("[%s] %s\n" % (_time.strftime("%H:%M:%S"), msg))
+                _logf.flush()
+            except Exception:
+                pass
+
+        _log("send_to_3d_view: graph=%s targets=%s skipped=%s"
+             % (graph_identifier, [(t["node"], t["channel"]) for t in targets],
+                skipped_nodes))
+
+        # ── Windows input helpers (real mouse, required by SD menus) ──────
+        class MOUSEINPUT(_ctypes.Structure):
+            _fields_ = [("dx", _wt.LONG), ("dy", _wt.LONG),
+                        ("mouseData", _wt.DWORD), ("dwFlags", _wt.DWORD),
+                        ("time", _wt.DWORD),
+                        ("dwExtraInfo", _ctypes.POINTER(_wt.ULONG))]
+
+        class INPUT(_ctypes.Structure):
+            class _I(_ctypes.Union):
+                _fields_ = [("mi", MOUSEINPUT)]
+            _anonymous_ = ("i",)
+            _fields_ = [("type", _wt.DWORD), ("i", _I)]
+
+        user32 = _ctypes.windll.user32
+        kernel32 = _ctypes.windll.kernel32
+
+        def _send_mouse(flag):
+            inp = INPUT(type=0)
+            inp.mi = MOUSEINPUT(0, 0, 0, flag, 0, None)
+            user32.SendInput(1, _ctypes.byref(inp), _ctypes.sizeof(INPUT))
+
+        def _real_click():
+            _send_mouse(0x0008)  # right down
+            _send_mouse(0x0010)  # right up
+            _send_mouse(0x0002)  # left down
+            _send_mouse(0x0004)  # left up
+
+        def _ensure_fg(hwnd):
+            try:
+                fg = user32.GetForegroundWindow()
+                t_fg = user32.GetWindowThreadProcessId(fg, None)
+                t_tgt = user32.GetWindowThreadProcessId(hwnd, None)
+                t_cur = kernel32.GetCurrentThreadId()
+                user32.AttachThreadInput(t_cur, t_fg, True)
+                user32.AttachThreadInput(t_cur, t_tgt, True)
+                user32.SetForegroundWindow(hwnd)
+                user32.SetFocus(hwnd)
+                user32.AttachThreadInput(t_cur, t_cur, False)
+                user32.AttachThreadInput(t_cur, t_fg, False)
+                user32.AttachThreadInput(t_cur, t_tgt, False)
+            except Exception:
+                pass
+
+        # ── Qt helpers ─────────────────────────────────────────────────────
+        def _visible_menus():
+            out = []
+            try:
+                pop = app.activePopupWidget()
+                if isinstance(pop, QMenu) and pop.isVisible():
+                    out.append(pop)
+            except Exception:
+                pass
+            for w in app.topLevelWidgets():
+                try:
+                    if isinstance(w, QMenu) and w.isVisible() and w not in out:
+                        out.append(w)
+                except Exception:
+                    pass
+            return out
+
+        def _find_action(menu, text):
+            for a in menu.actions():
+                try:
+                    if a.text() == text:
+                        return a
+                except Exception:
+                    pass
+            return None
+
+        def _close_menus():
+            for m in _visible_menus():
+                try:
+                    m.hide()
+                    m.close()
+                except Exception:
+                    pass
+
+        def _graph_view():
+            for w in app.allWidgets():
+                try:
+                    if (w.metaObject().className()
+                            == "Pfx::Editor::Components::Graph::GraphView"
+                            and w.isVisible()):
+                        return w
+                except Exception:
+                    pass
+            return None
+
+        uim = self._ui_mgr()
+        saved_cursor = QCursor.pos()
+        saved_fg = user32.GetForegroundWindow()
+        queue = list(targets)
+
+        def _finish():
+            _close_menus()
+            try:
+                QCursor.setPos(saved_cursor)
+            except Exception:
+                pass
+            try:
+                if saved_fg:
+                    user32.SetForegroundWindow(saved_fg)
+            except Exception:
+                pass
+            _log("finished (remaining=%d)" % len(queue))
+            try:
+                _logf.close()
+            except Exception:
+                pass
+
+        # ── Per-target cycles (timer-driven; menus run nested loops) ──────
+        def _cycle():
+            if not queue:
+                _finish()
+                return
+            t = queue[0]
+            _log("cycle start: node=%s channel=%s" % (t["node"], t["channel"]))
+            try:
+                _close_menus()
+                # Make sure the graph is shown in a graph view.
+                view_id = None
+                try:
+                    for i in range(uim.getGraphViewIDCount()):
+                        vid = uim.getGraphViewIDAt(i)
+                        vg = uim.getGraphFromGraphViewID(vid)
+                        if vg is not None and vg.getIdentifier() == graph_identifier:
+                            view_id = vid
+                            break
+                except Exception:
+                    pass
+                if view_id is None:
+                    try:
+                        uim.openResourceInEditor(graph)
+                    except Exception:
+                        pass
+                    t["_needs_view"] = t.get("_needs_view", 0) + 1
+                    if t["_needs_view"] > 6:
+                        raise RuntimeError("graph never appeared in a graph view")
+                    QTimer.singleShot(700, _cycle)
+                    return
+                uim.focusGraphNode(view_id, t["obj"])
+            except Exception as e:
+                _log("cycle setup error: %s" % e)
+                queue.pop(0)
+                QTimer.singleShot(400, _cycle)
+                return
+
+            gv = _graph_view()
+            if gv is None:
+                _log("no visible graph view")
+                queue.pop(0)
+                QTimer.singleShot(400, _cycle)
+                return
+            vp = gv.viewport()
+            click_pt = vp.mapToGlobal(vp.rect().center())
+            _ensure_fg(int(gv.window().winId()))
+            QCursor.setPos(click_pt)
+            QTimer.singleShot(180, lambda: (_send_mouse(0x0008), _send_mouse(0x0010)))
+            _log("right-click at %d,%d" % (click_pt.x(), click_pt.y()))
+
+            tries = [0]
+
+            def _poll_menu1():
+                tries[0] += 1
+                m1 = None
+                for m in _visible_menus():
+                    if _find_action(m, "View In 3D View") is not None:
+                        m1 = m
+                        break
+                if m1 is None:
+                    if tries[0] < 20:
+                        QTimer.singleShot(150, _poll_menu1)
+                    else:
+                        _log("menu1 not found for node %s" % t["node"])
+                        queue.pop(0)
+                        QTimer.singleShot(400, _cycle)
+                    return
+                act = _find_action(m1, "View In 3D View")
+                g = m1.mapToGlobal(m1.actionGeometry(act).center())
+                QCursor.setPos(g)
+                QTimer.singleShot(200, lambda: (_send_mouse(0x0002), _send_mouse(0x0004)))
+                _log("clicked 'View In 3D View' at %d,%d" % (g.x(), g.y()))
+                sub_tries = [0]
+
+                def _poll_sub():
+                    sub_tries[0] += 1
+                    sub = None
+                    for m in _visible_menus():
+                        if _find_action(m, t["channel"]) is not None:
+                            sub = m
+                            break
+                    if sub is None:
+                        if sub_tries[0] < 20:
+                            QTimer.singleShot(150, _poll_sub)
+                        else:
+                            _log("channel submenu not found for '%s'" % t["channel"])
+                            queue.pop(0)
+                            QTimer.singleShot(400, _cycle)
+                        return
+                    ca = _find_action(sub, t["channel"])
+                    cg = sub.mapToGlobal(sub.actionGeometry(ca).center())
+                    QCursor.setPos(cg)
+                    QTimer.singleShot(250,
+                        lambda: (_send_mouse(0x0002), _send_mouse(0x0004)))
+                    _log("clicked channel '%s' at %d,%d"
+                         % (t["channel"], cg.x(), cg.y()))
+
+                    def _done():
+                        _close_menus()
+                        _log("cycle done: node=%s channel=%s" % (t["node"], t["channel"]))
+                        queue.pop(0)
+                        try:
+                            QCursor.setPos(click_pt)
+                        except Exception:
+                            pass
+                        QTimer.singleShot(900, _cycle)
+
+                    QTimer.singleShot(1400, _done)
+
+                QTimer.singleShot(300, _poll_sub)
+
+            QTimer.singleShot(350, _poll_menu1)
+
+        QTimer.singleShot(300, _cycle)
+        return {
+            "scheduled": True,
+            "graph": graph_identifier,
+            "targets": [{"node": t["node"], "channel": t["channel"]}
+                        for t in targets],
+            "skipped": skipped_nodes,
+            "note": ("Binding {} channel(s) in the background (~3-6 s each, "
+                     "cursor moves during the run). Wait about {} s, then "
+                     "capture_3d_view(). The link is live: set_parameter edits "
+                     "auto re-render the view.").format(
+                         len(targets), max(12, 6 * len(targets))),
+        }
+
     def diagnostic(self):
         """Full health check of SD environment."""
         results = {}
@@ -1306,15 +2043,7 @@ class CommandHandler:
 
     def create_instance_node(self, resource_url, graph_identifier=None, position=None):
         graph = self._resolve_graph(graph_identifier)
-        resource = None
-        for pkg in list(self._pkg_mgr().getPackages()):
-            try:
-                r = pkg.findResourceFromUrl(resource_url)
-                if r is not None:
-                    resource = r
-                    break
-            except Exception:
-                pass
+        resource, resolved_url = self._resolve_res_url(resource_url)
         if not resource:
             raise ValueError("Resource '{}' not found.".format(resource_url))
         node = graph.newInstanceNode(resource)
@@ -1324,7 +2053,7 @@ class CommandHandler:
             node.setPosition(float2(float(position[0]), float(position[1])))
         return {
             "node_id":      node.getIdentifier(),
-            "resource_url": resource_url,
+            "resource_url": resolved_url,
             "position":     list(position) if position else [0.0, 0.0],
             "note":         "Call get_node_info to find exact port IDs before connecting.",
         }
@@ -1490,6 +2219,7 @@ class CommandHandler:
         return str(raw)
 
     def get_library_nodes(self, filter_text="", limit=200):
+        self._ensure_library_loaded()
         pkg_mgr = self._pkg_mgr()
         results = []
         for pkg in list(pkg_mgr.getPackages()):
@@ -1634,7 +2364,6 @@ class CommandHandler:
                       graph_identifier=None):
         graph = self._resolve_graph(graph_identifier)
         node  = self._find_node(graph, node_id)
-        sd_value = self._make_sd_value(value_type, value)
 
         input_ids  = set()
         annot_ids  = set()
@@ -1648,6 +2377,18 @@ class CommandHandler:
                 annot_ids.add(p.getId())
         except Exception:
             pass
+
+        orig_parameter_id = parameter_id
+        parameter_id, value_factor, renamed = self._resolve_param_id(
+            parameter_id, {i: "" for i in input_ids}, {i: "" for i in annot_ids})
+        if value_factor != 1.0 and isinstance(value, (int, float)) \
+                and abs(value) <= 1.0:
+            value = value * value_factor
+        if renamed:
+            _log("Param '{}' -> '{}' on '{}'".format(
+                orig_parameter_id, parameter_id, node_id))
+
+        sd_value = self._make_sd_value(value_type, value)
 
         if (input_ids or annot_ids) and \
            parameter_id not in input_ids and parameter_id not in annot_ids:
@@ -1671,12 +2412,15 @@ class CommandHandler:
             raise RuntimeError("Failed to set '{}' on node '{}': {}".format(
                 parameter_id, node_id, last_err))
 
-        return {
+        result = {
             "node_id":      node_id,
             "parameter_id": parameter_id,
             "value":        value,
             "value_type":   value_type,
         }
+        if renamed:
+            result["renamed_from"] = orig_parameter_id
+        return result
 
     def set_graph_output_size(self, width_log2=11, height_log2=11, graph_identifier=None):
         graph = self._resolve_graph(graph_identifier)
@@ -1728,6 +2472,7 @@ class CommandHandler:
         alias_map = {}       # alias -> (node_obj, node_id_str)
         created   = []
         failed    = []
+        param_warnings = []
 
         for spec in nodes:
             defn_id  = spec.get("definition_id", "sbs::compositing::uniform")
@@ -1755,15 +2500,7 @@ class CommandHandler:
                             pass
 
                 elif res_url:
-                    resource = None
-                    for p in list(self._pkg_mgr().getPackages()):
-                        try:
-                            r = p.findResourceFromUrl(res_url)
-                            if r is not None:
-                                resource = r
-                                break
-                        except Exception:
-                            pass
+                    resource, _resolved = self._resolve_res_url(res_url)
                     node = graph.newInstanceNode(resource) if resource else None
                     if not node:
                         raise ValueError("Resource '{}' not found.".format(res_url))
@@ -1781,7 +2518,11 @@ class CommandHandler:
                     raise RuntimeError("newNode returned None for '{}'.".format(defn_id))
 
                 node.setPosition(float2(float(pos[0]), float(pos[1])))
-                self._set_node_params(node, params)
+                pstatus = self._set_node_params(node, params)
+                for _pk, _pv in (pstatus or {}).items():
+                    if _pv == "skipped" or str(_pv).startswith("error"):
+                        param_warnings.append(
+                            {"alias": alias, "param": _pk, "status": _pv})
 
                 node_id = node.getIdentifier()
                 # deduplicate aliases
@@ -1827,7 +2568,7 @@ class CommandHandler:
             except Exception as e:
                 _log("Warning: openResourceInEditor failed: {}".format(e))
 
-        return {
+        result = {
             "graph_identifier":  graph.getIdentifier(),
             "requested_name":    graph_name,
             "nodes_created":     len(created),
@@ -1839,6 +2580,9 @@ class CommandHandler:
             "failed_nodes":      failed,
             "connections":       conn_results,
         }
+        if param_warnings:
+            result["param_warnings"] = param_warnings
+        return result
 
     # ═══════════════════════════════════════════════════════════════════════
     # ── SMART MATERIAL GRAPH BUILDER ────────────────────────────────────
@@ -2011,6 +2755,7 @@ class CommandHandler:
         alias_map = {}
         created   = []
         failed    = []
+        param_warnings = []
 
         for spec in nodes:
             defn_id    = spec.get("definition_id", "sbs::compositing::uniform")
@@ -2035,15 +2780,7 @@ class CommandHandler:
                         except Exception:
                             pass
                 elif res_url:
-                    resource = None
-                    for p in list(self._pkg_mgr().getPackages()):
-                        try:
-                            r = p.findResourceFromUrl(res_url)
-                            if r is not None:
-                                resource = r
-                                break
-                        except Exception:
-                            pass
+                    resource, _resolved = self._resolve_res_url(res_url)
                     node = graph.newInstanceNode(resource) if resource else None
                     if not node:
                         raise ValueError("Resource '{}' not found.".format(res_url))
@@ -2058,7 +2795,11 @@ class CommandHandler:
                     raise RuntimeError("newNode returned None.")
 
                 node.setPosition(float2(float(pos[0]), float(pos[1])))
-                self._set_node_params(node, params)
+                pstatus = self._set_node_params(node, params)
+                for _pk, _pv in (pstatus or {}).items():
+                    if _pv == "skipped" or str(_pv).startswith("error"):
+                        param_warnings.append(
+                            {"alias": alias, "param": _pk, "status": _pv})
 
                 nid = node.getIdentifier()
                 counter = 0
@@ -2089,7 +2830,7 @@ class CommandHandler:
             except Exception as e:
                 conn_results.append({"from": fa, "to": ta, "success": False, "error": str(e)})
 
-        return {
+        result = {
             "graph_identifier":  graph.getIdentifier(),
             "recipe":            recipe_name,
             "nodes_added":       len(created),
@@ -2098,6 +2839,9 @@ class CommandHandler:
             "connections_failed": sum(1 for c in conn_results if not c.get("success")),
             "node_map":          {a: nid for a, (_, nid) in alias_map.items()},
         }
+        if param_warnings:
+            result["param_warnings"] = param_warnings
+        return result
 
     # ═══════════════════════════════════════════════════════════════════════
     # ── UTILITIES ───────────────────────────────────────────────────────
