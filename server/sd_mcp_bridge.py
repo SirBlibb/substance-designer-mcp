@@ -218,8 +218,9 @@ Recommended workflow:
    port IDs (closest match first), so read the error and retry with the suggested ID.
    list_documentation(category="port_reference") lists known ports, and
    list_documentation(action="search", query=...) searches all docs.
-4. To check the result visually, open the 3D view in SD (F3) and call
-   capture_3d_view, which returns the rendered preview as an image. Iterate with
+4. To check the result visually, open the 3D view in SD (F3), call
+   send_to_3d_view(graph) to show that graph's material there (no mouse control
+   needed), then capture_3d_view, which returns the rendered preview as an image. Iterate with
    set_parameter, then capture again (refresh_first=True if the render looks stale).
 5. Changes are in memory until save_package is called.
 
@@ -815,6 +816,47 @@ async def capture_3d_view(ctx: Context,
     if return_image and path and os.path.isfile(path):
         content.append(Image(path=path))
     return content
+
+
+@mcp.tool(annotations=_UPDATE, structured_output=False)
+async def send_to_3d_view(ctx: Context,
+                          graph_identifier: str,
+                          channels: Optional[Dict[str, str]] = None,
+                          timeout_s: float = 90.0) -> str:
+    """
+    Show a graph's material in the SD 3D view by binding its output nodes to
+    the 3D view material channels (what right-click -> "View In 3D View" does).
+
+    Runs inside SD with synthetic Qt events: the mouse cursor is not moved and
+    SD is not brought to the front. SD switches its editor tab to the graph.
+    Takes about 2-3 s per channel; this call waits until all are done.
+
+    - graph_identifier: graph name as shown in the Explorer
+    - channels: optional {output node id or label: channel name} overrides.
+      By default each output's label picks the channel ("Base Color",
+      "Normal", "Roughness", "Metallic", "Ambient Occlusion", "Height", ...)
+    - timeout_s: give up waiting after this many seconds
+
+    Returns JSON {job_id, graph, done, bound, failed, skipped, pending}.
+    The binding is live: later set_parameter edits re-render the 3D view, so
+    call capture_3d_view to see the result.
+    """
+    start = await asyncio.to_thread(_request, "send_to_3d_view", {
+        "graph_identifier": graph_identifier,
+        "channels": channels,
+    })
+    deadline = time.monotonic() + timeout_s
+    status = start
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+        status = await asyncio.to_thread(
+            _request, "send_to_3d_view_status", {"job_id": start["job_id"]})
+        if status.get("done"):
+            break
+    else:
+        status = dict(status, note="Timed out waiting; the job may still be "
+                                   "running inside SD.")
+    return json.dumps(status, indent=2)
 
 
 @mcp.tool(annotations=_ADDITIVE, structured_output=False)

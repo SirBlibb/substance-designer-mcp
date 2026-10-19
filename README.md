@@ -157,6 +157,7 @@ List all available material recipes
 | `open_graph` | Open a graph in the SD editor |
 | `save_package` | Save the package to disk |
 | `capture_3d_view` | Return the SD 3D view as an image (to judge the material visually) |
+| `send_to_3d_view` | Bind a graph's outputs to the 3D view material channels, without moving the mouse |
 | `list_documentation` | Browse/search the embedded SD knowledge base (nodes, ports, blend modes) |
 | `execute_sd_code` | Execute arbitrary Python in SD's context |
 | `reload_plugin` | Hot-reload the plugin's Python code from disk (development) |

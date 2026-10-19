@@ -757,6 +757,7 @@ class CommandHandler:
             "execute_code":           self.execute_code,
             "capture_3d_view":        self.capture_3d_view,
             "send_to_3d_view":        self.send_to_3d_view,
+            "send_to_3d_view_status": self.send_to_3d_view_status,
             # ── Documentation ──
             "list_documentation":     self.list_documentation,
             # ── Development ──
@@ -1632,34 +1633,30 @@ class CommandHandler:
         a persistent material whose channels are assigned per OUTPUT NODE via
         the graph editor: right-click the node -> "View In 3D View" -> pick the
         material channel (Base Color, Normal, Roughness, Metallic, Ambient
-        Occlusion, Height, ...). This handler automates that whole flow using
-        real mouse input (SD's graph menus only commit on real clicks).
+        Occlusion, Height, ...). The public API has no call for this, so the
+        handler drives those menus with synthetic Qt mouse events sent straight
+        to SD's widgets: the OS cursor never moves, SD is not brought to the
+        front, and the user's other windows are untouched. SD does switch its
+        editor tab to the graph.
 
         Channel per output is derived from the output node's label (e.g.
         'Base Color', 'Normal'). Use `channels` to override, keyed by output
         node identifier or label, valued with the menu channel name.
 
         Once bound the link is LIVE: every set_parameter edit re-renders the
-        view automatically. Loop: send_to_3d_view -> capture_3d_view ->
-        set_parameter -> capture_3d_view ...
+        view automatically.
 
-        The chain runs in the background via QTimer (SD's main thread is
-        briefly busy between cycles -- roughly 3-6 s per channel, and the
-        cursor is moved while it runs; it is restored at the end). Wait about
-        (channels x 6) seconds before capturing.
+        The menus run nested event loops, so the chain is timer-driven and
+        this returns at once with a job id (about 1.5 s per channel). Poll
+        send_to_3d_view_status(job_id) until done is True.
 
         - graph_identifier: graph name as shown in the Explorer (e.g. 'Test_Steel')
         - channels: optional dict {node_id_or_label: channel_text}
-        Returns {scheduled: True, graph, targets: [{node, channel}...], note}.
+        Returns {job_id, graph, targets: [{node, channel}...], skipped}.
         """
-        import os as _os
-        import tempfile as _tempfile
-        import time as _time
-        import ctypes as _ctypes
-        import ctypes.wintypes as _wt
         from PySide6.QtWidgets import QApplication, QMenu
-        from PySide6.QtCore import QTimer, QPoint
-        from PySide6.QtGui import QCursor
+        from PySide6.QtCore import QTimer, QPointF, Qt, QEvent
+        from PySide6.QtGui import QMouseEvent
         from sd.api.sdproperty import SDPropertyCategory
 
         app = QApplication.instance()
@@ -1716,106 +1713,95 @@ class CommandHandler:
             raise ValueError(
                 "No bindable outputs (labels: {}). Provide 'channels' override."
                 .format([s.get("label") for s in skipped]))
-        skipped_nodes = [s for s in skipped]
 
-        # ── Log file for diagnostics ──────────────────────────────────────
-        log_dir = _os.path.join(_tempfile.gettempdir(), "sd_mcp_preview")
-        try:
-            _os.makedirs(log_dir, exist_ok=True)
-        except Exception:
-            pass
-        log_path = _os.path.join(log_dir, "send3d_log.txt")
-        _logf = open(log_path, "a", encoding="utf-8")
+        prev = getattr(self, "_send3d_job", None)
+        if prev is not None and not prev["done"]:
+            raise RuntimeError(
+                "send_to_3d_view job {} is still running; poll "
+                "send_to_3d_view_status until it is done.".format(prev["job_id"]))
 
-        def _log(msg):
-            try:
-                _logf.write("[%s] %s\n" % (_time.strftime("%H:%M:%S"), msg))
-                _logf.flush()
-            except Exception:
-                pass
+        job = {
+            "job_id": (prev["job_id"] + 1) if prev else 1,
+            "graph": graph_identifier,
+            "done": False,
+            "bound": [],
+            "failed": [],
+            "skipped": skipped,
+            "pending": [{"node": t["node"], "channel": t["channel"]}
+                        for t in targets],
+        }
+        self._send3d_job = job
 
-        _log("send_to_3d_view: graph=%s targets=%s skipped=%s"
-             % (graph_identifier, [(t["node"], t["channel"]) for t in targets],
-                skipped_nodes))
-
-        # ── Windows input helpers (real mouse, required by SD menus) ──────
-        class MOUSEINPUT(_ctypes.Structure):
-            _fields_ = [("dx", _wt.LONG), ("dy", _wt.LONG),
-                        ("mouseData", _wt.DWORD), ("dwFlags", _wt.DWORD),
-                        ("time", _wt.DWORD),
-                        ("dwExtraInfo", _ctypes.POINTER(_wt.ULONG))]
-
-        class INPUT(_ctypes.Structure):
-            class _I(_ctypes.Union):
-                _fields_ = [("mi", MOUSEINPUT)]
-            _anonymous_ = ("i",)
-            _fields_ = [("type", _wt.DWORD), ("i", _I)]
-
-        user32 = _ctypes.windll.user32
-        kernel32 = _ctypes.windll.kernel32
-
-        def _send_mouse(flag):
-            inp = INPUT(type=0)
-            inp.mi = MOUSEINPUT(0, 0, 0, flag, 0, None)
-            user32.SendInput(1, _ctypes.byref(inp), _ctypes.sizeof(INPUT))
-
-        def _real_click():
-            _send_mouse(0x0008)  # right down
-            _send_mouse(0x0010)  # right up
-            _send_mouse(0x0002)  # left down
-            _send_mouse(0x0004)  # left up
-
-        def _ensure_fg(hwnd):
-            try:
-                fg = user32.GetForegroundWindow()
-                t_fg = user32.GetWindowThreadProcessId(fg, None)
-                t_tgt = user32.GetWindowThreadProcessId(hwnd, None)
-                t_cur = kernel32.GetCurrentThreadId()
-                user32.AttachThreadInput(t_cur, t_fg, True)
-                user32.AttachThreadInput(t_cur, t_tgt, True)
-                user32.SetForegroundWindow(hwnd)
-                user32.SetFocus(hwnd)
-                user32.AttachThreadInput(t_cur, t_cur, False)
-                user32.AttachThreadInput(t_cur, t_fg, False)
-                user32.AttachThreadInput(t_cur, t_tgt, False)
-            except Exception:
-                pass
-
-        # ── Qt helpers ─────────────────────────────────────────────────────
+        # ── Synthetic-input helpers (no OS input, no cursor movement) ─────
         def _visible_menus():
             out = []
-            try:
-                pop = app.activePopupWidget()
-                if isinstance(pop, QMenu) and pop.isVisible():
-                    out.append(pop)
-            except Exception:
-                pass
             for w in app.topLevelWidgets():
                 try:
-                    if isinstance(w, QMenu) and w.isVisible() and w not in out:
+                    if isinstance(w, QMenu) and w.isVisible():
                         out.append(w)
                 except Exception:
                     pass
             return out
 
-        def _find_action(menu, text):
-            for a in menu.actions():
-                try:
-                    if a.text() == text:
-                        return a
-                except Exception:
-                    pass
-            return None
+        def _find_action(text):
+            for m in _visible_menus():
+                for a in m.actions():
+                    try:
+                        if a.text() == text:
+                            return m, a
+                    except Exception:
+                        pass
+            return None, None
 
         def _close_menus():
             for m in _visible_menus():
                 try:
-                    m.hide()
                     m.close()
                 except Exception:
                     pass
 
+        def _click(widget, pt, button):
+            p = QPointF(pt)
+            gp = QPointF(widget.mapToGlobal(pt))
+            app.sendEvent(widget, QMouseEvent(
+                QEvent.MouseMove, p, gp, Qt.NoButton, Qt.NoButton, Qt.NoModifier))
+            app.sendEvent(widget, QMouseEvent(
+                QEvent.MouseButtonPress, p, gp, button, button, Qt.NoModifier))
+            app.sendEvent(widget, QMouseEvent(
+                QEvent.MouseButtonRelease, p, gp, button, Qt.NoButton, Qt.NoModifier))
+
+        def _later(ms, fn):
+            # Timer callbacks swallow exceptions; record them on the job so a
+            # failure never leaves it stuck at done=False.
+            def _run():
+                try:
+                    fn()
+                except Exception as e:
+                    _close_menus()
+                    if queue:
+                        _fail(queue[0], "{}: {}".format(type(e).__name__, e))
+                    else:
+                        job["done"] = True
+            QTimer.singleShot(int(ms), _run)
+
+        def _wait_for(text, then, on_timeout, tries=25):
+            # Poll for a visible menu holding `text`. The context menu runs a
+            # nested event loop, so these timers keep firing while it is open.
+            def _poll(n=0):
+                m, a = _find_action(text)
+                if a is not None:
+                    then(m, a)
+                elif n < tries:
+                    _later(120, lambda: _poll(n + 1))
+                else:
+                    _close_menus()
+                    on_timeout("menu item '{}' never appeared".format(text))
+            _later(120, _poll)
+
         def _graph_view():
+            # openResourceInEditor fronted this graph's tab, so its view is
+            # the visible one. (The Qt wrapper's getGraphView hands back
+            # short-lived objects that get deleted under us.)
             for w in app.allWidgets():
                 try:
                     if (w.metaObject().className()
@@ -1827,153 +1813,107 @@ class CommandHandler:
             return None
 
         uim = self._ui_mgr()
-        saved_cursor = QCursor.pos()
-        saved_fg = user32.GetForegroundWindow()
         queue = list(targets)
 
-        def _finish():
-            _close_menus()
+        def _find_view_id():
             try:
-                QCursor.setPos(saved_cursor)
+                for i in range(uim.getGraphViewIDCount()):
+                    vid = uim.getGraphViewIDAt(i)
+                    vg = uim.getGraphFromGraphViewID(vid)
+                    if vg is not None and vg.getIdentifier() == graph.getIdentifier():
+                        return vid
             except Exception:
                 pass
-            try:
-                if saved_fg:
-                    user32.SetForegroundWindow(saved_fg)
-            except Exception:
-                pass
-            _log("finished (remaining=%d)" % len(queue))
-            try:
-                _logf.close()
-            except Exception:
-                pass
+            return None
+
+        def _next():
+            _later(200, _cycle)
+
+        def _fail(t, reason):
+            job["failed"].append({"node": t["node"], "channel": t["channel"],
+                                  "reason": reason})
+            job["pending"].pop(0)
+            queue.pop(0)
+            _next()
 
         # ── Per-target cycles (timer-driven; menus run nested loops) ──────
         def _cycle():
             if not queue:
-                _finish()
+                _close_menus()
+                job["done"] = True
                 return
             t = queue[0]
-            _log("cycle start: node=%s channel=%s" % (t["node"], t["channel"]))
             try:
                 _close_menus()
-                # Make sure the graph is shown in a graph view.
-                view_id = None
-                try:
-                    for i in range(uim.getGraphViewIDCount()):
-                        vid = uim.getGraphViewIDAt(i)
-                        vg = uim.getGraphFromGraphViewID(vid)
-                        if vg is not None and vg.getIdentifier() == graph_identifier:
-                            view_id = vid
-                            break
-                except Exception:
-                    pass
+                # Bring this graph's tab to the front so its view is live.
+                uim.openResourceInEditor(graph)
+                view_id = _find_view_id()
                 if view_id is None:
-                    try:
-                        uim.openResourceInEditor(graph)
-                    except Exception:
-                        pass
                     t["_needs_view"] = t.get("_needs_view", 0) + 1
                     if t["_needs_view"] > 6:
-                        raise RuntimeError("graph never appeared in a graph view")
-                    QTimer.singleShot(700, _cycle)
+                        _fail(t, "graph never appeared in a graph view")
+                    else:
+                        _later(500, _cycle)
                     return
                 uim.focusGraphNode(view_id, t["obj"])
             except Exception as e:
-                _log("cycle setup error: %s" % e)
-                queue.pop(0)
-                QTimer.singleShot(400, _cycle)
+                _fail(t, "setup error: {}".format(e))
                 return
+            # focusGraphNode pans the view; let it settle before clicking.
+            _later(800, lambda: _open_menu(t))
 
+        def _open_menu(t):
             gv = _graph_view()
             if gv is None:
-                _log("no visible graph view")
-                queue.pop(0)
-                QTimer.singleShot(400, _cycle)
+                _fail(t, "no visible graph view")
                 return
             vp = gv.viewport()
-            click_pt = vp.mapToGlobal(vp.rect().center())
-            _ensure_fg(int(gv.window().winId()))
-            QCursor.setPos(click_pt)
-            QTimer.singleShot(180, lambda: (_send_mouse(0x0008), _send_mouse(0x0010)))
-            _log("right-click at %d,%d" % (click_pt.x(), click_pt.y()))
+            center = vp.rect().center()
+            if gv.itemAt(center) is None:
+                _fail(t, "node not under the view center after focusing")
+                return
+            _wait_for("View In 3D View", lambda m, a: _pick_view3d(t, m, a),
+                      lambda r: _fail(t, r))
+            _click(vp, center, Qt.RightButton)
 
-            tries = [0]
+        def _pick_view3d(t, m, a):
+            _wait_for(t["channel"], lambda m2, a2: _pick_channel(t, m2, a2),
+                      lambda r: _fail(t, r))
+            _click(m, m.actionGeometry(a).center(), Qt.LeftButton)
 
-            def _poll_menu1():
-                tries[0] += 1
-                m1 = None
-                for m in _visible_menus():
-                    if _find_action(m, "View In 3D View") is not None:
-                        m1 = m
-                        break
-                if m1 is None:
-                    if tries[0] < 20:
-                        QTimer.singleShot(150, _poll_menu1)
-                    else:
-                        _log("menu1 not found for node %s" % t["node"])
-                        queue.pop(0)
-                        QTimer.singleShot(400, _cycle)
-                    return
-                act = _find_action(m1, "View In 3D View")
-                g = m1.mapToGlobal(m1.actionGeometry(act).center())
-                QCursor.setPos(g)
-                QTimer.singleShot(200, lambda: (_send_mouse(0x0002), _send_mouse(0x0004)))
-                _log("clicked 'View In 3D View' at %d,%d" % (g.x(), g.y()))
-                sub_tries = [0]
+        def _pick_channel(t, m, a):
+            _click(m, m.actionGeometry(a).center(), Qt.LeftButton)
 
-                def _poll_sub():
-                    sub_tries[0] += 1
-                    sub = None
-                    for m in _visible_menus():
-                        if _find_action(m, t["channel"]) is not None:
-                            sub = m
-                            break
-                    if sub is None:
-                        if sub_tries[0] < 20:
-                            QTimer.singleShot(150, _poll_sub)
-                        else:
-                            _log("channel submenu not found for '%s'" % t["channel"])
-                            queue.pop(0)
-                            QTimer.singleShot(400, _cycle)
-                        return
-                    ca = _find_action(sub, t["channel"])
-                    cg = sub.mapToGlobal(sub.actionGeometry(ca).center())
-                    QCursor.setPos(cg)
-                    QTimer.singleShot(250,
-                        lambda: (_send_mouse(0x0002), _send_mouse(0x0004)))
-                    _log("clicked channel '%s' at %d,%d"
-                         % (t["channel"], cg.x(), cg.y()))
+            def _done():
+                _close_menus()
+                job["bound"].append({"node": t["node"], "channel": t["channel"]})
+                job["pending"].pop(0)
+                queue.pop(0)
+                _next()
 
-                    def _done():
-                        _close_menus()
-                        _log("cycle done: node=%s channel=%s" % (t["node"], t["channel"]))
-                        queue.pop(0)
-                        try:
-                            QCursor.setPos(click_pt)
-                        except Exception:
-                            pass
-                        QTimer.singleShot(900, _cycle)
+            _later(300, _done)
 
-                    QTimer.singleShot(1400, _done)
-
-                QTimer.singleShot(300, _poll_sub)
-
-            QTimer.singleShot(350, _poll_menu1)
-
-        QTimer.singleShot(300, _cycle)
+        _later(100, _cycle)
         return {
-            "scheduled": True,
+            "job_id": job["job_id"],
             "graph": graph_identifier,
             "targets": [{"node": t["node"], "channel": t["channel"]}
                         for t in targets],
-            "skipped": skipped_nodes,
-            "note": ("Binding {} channel(s) in the background (~3-6 s each, "
-                     "cursor moves during the run). Wait about {} s, then "
-                     "capture_3d_view(). The link is live: set_parameter edits "
-                     "auto re-render the view.").format(
-                         len(targets), max(12, 6 * len(targets))),
+            "skipped": skipped,
         }
+
+    def send_to_3d_view_status(self, job_id=None):
+        """Progress of the last send_to_3d_view job.
+
+        Returns {job_id, graph, done, bound, failed, pending, skipped}.
+        """
+        job = getattr(self, "_send3d_job", None)
+        if job is None:
+            raise ValueError("No send_to_3d_view job has been started.")
+        if job_id is not None and int(job_id) != job["job_id"]:
+            raise ValueError("Unknown job {} (latest is {}).".format(
+                job_id, job["job_id"]))
+        return dict(job)
 
     def diagnostic(self):
         """Full health check of SD environment."""

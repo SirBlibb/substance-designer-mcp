@@ -12,11 +12,16 @@ All notable changes to the Substance Designer MCP Plugin are documented here.
   case-insensitively; unknown batch aliases list the known aliases
 - `reload_plugin` command: hot-reloads recipes, documentation and the command handlers
   without restarting SD (keeps the TCP server and Qt invoker)
+- `send_to_3d_view` drives SD's "View In 3D View" menus with synthetic Qt mouse events
+  instead of OS-level input: the cursor no longer moves and SD is not raised. Progress
+  is reported by the new `send_to_3d_view_status` command; a failing step marks that
+  channel failed instead of stalling the job
 
 ### Bridge
 - `create_batch_graph` nodes/connections and recipe `overrides` are typed (Pydantic), so
   the MCP input schema documents every field; the wire format to the plugin is unchanged
 - New `reload_plugin` tool
+- New `send_to_3d_view` tool: binds a graph's outputs to the 3D view and waits for the result
 - Pytest suite (`cd server && uv run pytest`) against a fake SD server; `live` tests run
   only when SD listens on 9881. Replaces the old hardcoded-path test scripts
 

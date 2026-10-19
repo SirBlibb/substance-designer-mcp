@@ -262,3 +262,31 @@ async def test_waiting_call_does_not_hold_a_plugin_connection(fake_sd):
     await asyncio.to_thread(waiting.join, 5)
     assert not waiting.is_alive()
     assert [c["type"] for c in fake_sd.received] == ["get_node_info", "get_scene_info"]
+
+
+# ── send_to_3d_view ────────────────────────────────────────────────────────
+
+async def test_send_to_3d_view_polls_until_done(fake_sd, client):
+    polls = []
+
+    def handler(cmd_type, params):
+        if cmd_type == "send_to_3d_view":
+            return {"status": "success",
+                    "result": {"job_id": 7, "graph": "G", "targets": [], "skipped": []}}
+        polls.append(params)
+        done = len(polls) >= 2
+        return {"status": "success",
+                "result": {"job_id": 7, "graph": "G", "done": done,
+                           "bound": [{"node": "1", "channel": "Base Color"}] if done else [],
+                           "failed": [], "skipped": [], "pending": []}}
+
+    fake_sd.handler = handler
+    result = await client.call_tool("send_to_3d_view", {
+        "graph_identifier": "G", "channels": {"1": "Base Color"}})
+    assert not result.isError
+    status = json.loads(result.content[0].text)
+    assert status["done"] is True
+    assert status["bound"] == [{"node": "1", "channel": "Base Color"}]
+    assert fake_sd.received[0]["params"] == {
+        "graph_identifier": "G", "channels": {"1": "Base Color"}}
+    assert all(p == {"job_id": 7} for p in polls)
