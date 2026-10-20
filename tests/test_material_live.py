@@ -61,8 +61,20 @@ async def scratch(client, tmp_path, monkeypatch):
     package_index = await _new_scratch_package(client, tmp_path)
 
     graph_name = "MR_Live_{}".format(uuid.uuid4().hex[:6])
-    graph = _json(await client.call_tool("create_graph", {
-        "graph_name": graph_name, "package_index": package_index}))
+    built = _json(await client.call_tool("create_batch_graph", {
+        "graph_name": graph_name,
+        "package_index": package_index,
+        "output_size_log2": 9,
+        "nodes": [
+            {"id_alias": "color", "definition_id": "sbs::compositing::uniform"},
+            {"id_alias": "height", "definition_id": "sbs::compositing::output",
+             "usage": "height", "label": "Height"},
+        ],
+        "connections": [
+            {"from": "color", "to": "height", "to_input": "inputNodeOutput"},
+        ],
+    }))
+    graph_name = built["graph_identifier"]
     package_path = str(tmp_path / "scratch.sbs")
     await client.call_tool("save_package", {
         "package_index": package_index, "file_path": package_path})
@@ -74,27 +86,14 @@ async def scratch(client, tmp_path, monkeypatch):
             package_index = entry["index"]
             break
 
-    await client.call_tool("create_batch_graph", {
-        "graph_name": graph["identifier"],
-        "package_index": package_index,
-        "output_size_log2": 9,
-        "nodes": [
-            {"id_alias": "color", "definition_id": "sbs::compositing::uniform"},
-            {"id_alias": "height", "definition_id": "sbs::compositing::output",
-             "usage": "height", "label": "Height"},
-        ],
-        "connections": [
-            {"from": "color", "to": "height", "to_input": "inputNodeOutput"},
-        ],
-    })
     try:
-        yield {"graph": graph["identifier"], "package_index": package_index,
+        yield {"graph": graph_name, "package_index": package_index,
                "package_path": package_path}
     finally:
         await client.call_tool("delete_graph", {
-            "graph_identifier": graph["identifier"]})
+            "graph_identifier": graph_name})
         await client.call_tool("save_package", {
-            "package_index": package_index})
+            "package_path": package_path})
 
 
 async def test_live_material_run_workflow(client, scratch):
@@ -102,8 +101,9 @@ async def test_live_material_run_workflow(client, scratch):
     started = _json(await client.call_tool("start_material_run", {
         "graph_identifier": graph,
         "goal": "live workflow test",
-        "max_iterations": 1,
-        "preview_preset": {"include_3d": False, "max_size": 512},
+        "max_iterations": 2,
+        "preview_preset": {"include_3d": False, "max_size": 512,
+                           "output_usages": ["height"]},
         "package_index": scratch["package_index"],
         "package_path": scratch["package_path"],
     }))
@@ -157,8 +157,10 @@ async def test_live_material_run_workflow(client, scratch):
         "run_id": run_id, "revision_id": revision["revision_id"],
         "force": True}))
     assert restored["revision"]["revision_id"] == revision["revision_id"]
+    assert restored["fingerprint_sha256"] == revision["full_sha256"]
 
     finished = _json(await client.call_tool(
         "finish_material_run", {"run_id": run_id, "notes": "live"}))
     assert finished["run"]["state"] == "finished"
+    assert finished["run"]["current_revision_id"] == best_id
     assert finished["report"]["best_revision_id"] == best_id

@@ -967,6 +967,14 @@ class MaterialRunController:
         if not os.path.isfile(revision.checkpoint_path):
             raise RunError("Checkpoint file for revision '{}' is missing: {}".format(
                 revision.revision_id, revision.checkpoint_path))
+        if revision.checkpoint_sha256:
+            actual_sha = sha256_file(revision.checkpoint_path)
+            if actual_sha != revision.checkpoint_sha256:
+                raise RunError(
+                    "Checkpoint file for revision '{}' no longer matches its "
+                    "recorded sha256 (expected {}, got {}). Run "
+                    "verify_material_checkpoint or restore another revision.".format(
+                        revision.revision_id, revision.checkpoint_sha256, actual_sha))
         if save_back is None:
             save_back = not _is_inside(run.package_path, self.runs_dir)
         result = self._call(CMD_RESTORE, {

@@ -25,7 +25,9 @@ All notable changes to the Substance Designer MCP Plugin are documented here.
     `decide_material_candidate`, `finish_material_run` (restores the best
     accepted revision)
   - The controller is Qt-free, serialises every SD operation on one lock and
-    resumes runs after a bridge restart.
+    resumes runs after a bridge restart. Restores re-check the checkpoint
+    file's recorded sha256 before loading it, so a modified or corrupted
+    checkpoint is refused instead of silently restoring.
 - Added `--runs-dir` for the material-run database and checkpoints.
 - `checkpoint_package`, `restore_package`, `verify_checkpoint` and
   `graph_fingerprint` use the heavy timeout profile.
@@ -94,6 +96,9 @@ All notable changes to the Substance Designer MCP Plugin are documented here.
     connection flags, annotations), the full connection list, graph inputs and
     output node ids - used for drift detection and restore verification.
 - `PLUGIN_VERSION` is now 3.9.0; the bridge logs the loaded plugin version.
+- Package lookups by path normalise case and separators: SD reports stored
+  paths with forward slashes (`C:/...`) while callers may pass Windows-style
+  paths, which previously made checkpointing a saved package fail.
 
 ### Plugin (v3.8.0)
 - `capture_node_preview` command: grabs each node's graph-editor tile (which

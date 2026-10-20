@@ -1136,8 +1136,15 @@ class CommandHandler:
     def _resolve_package(self, package_index=0, package_path=None):
         pkgs = list(self._pkg_mgr().getUserPackages())
         if package_path:
+            wanted = os.path.normcase(os.path.abspath(package_path))
             for pkg in pkgs:
-                if pkg.getFilePath() == package_path:
+                try:
+                    stored = pkg.getFilePath()
+                except Exception:
+                    continue
+                if not stored:
+                    continue
+                if os.path.normcase(os.path.abspath(stored)) == wanted:
                     return pkg
             raise ValueError("Package '{}' not found.".format(package_path))
         if not pkgs:

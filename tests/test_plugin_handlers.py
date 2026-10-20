@@ -5,6 +5,7 @@ package is installed before loading plugin/__init__.py. Tests monkeypatch the
 handler methods that would otherwise call SD.
 """
 import importlib.util
+import os
 import socket
 import sys
 import threading
@@ -840,6 +841,21 @@ def test_graph_fingerprint_command_resolves_graph(handler, monkeypatch):
     monkeypatch.setattr(handler, "_resolve_graph",
                         lambda gid: _checkpoint_graph())
     assert handler.graph_fingerprint("G")["graph_identifier"] == "G"
+
+
+def test_resolve_package_normalizes_path_case_and_separators(handler, monkeypatch,
+                                                             tmp_path):
+    real = tmp_path / "work.sbs"
+    stored = str(real)
+    if os.name == "nt":
+        stored = stored.replace("\\", "/")
+    pkg = _FakePackage(stored)
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: _FakePackageMgr([pkg]))
+
+    assert handler._resolve_package(0, str(real)) is pkg
+    assert handler._resolve_package(0, str(tmp_path / "." / "work.sbs")) is pkg
+    with pytest.raises(ValueError, match="not found"):
+        handler._resolve_package(0, str(tmp_path / "other.sbs"))
 
 
 def test_checkpoint_package_saves_copy_and_fingerprint(handler, monkeypatch,

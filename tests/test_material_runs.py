@@ -524,6 +524,17 @@ def test_restore_requires_force_when_graph_has_uncheckpointed_changes(env):
     assert designer.nodes["blur"]["params"]["intensity"][0] == 5.0
 
 
+def test_restore_refuses_tampered_checkpoint_file(env):
+    designer, store, controller = env
+    run_id = _start(controller)
+    baseline = _baseline(controller, run_id)["revision"]
+    with open(baseline["checkpoint_path"], "ab") as fh:
+        fh.write(b"tampered")
+    with pytest.raises(mr.RunError, match="no longer matches"):
+        controller.restore_revision(run_id)
+    assert store.get_run(run_id).state == "baseline_ready"
+
+
 def test_iteration_budget_finishes_run(env):
     designer, store, controller = env
     run_id = _start(controller, max_iterations=1)
