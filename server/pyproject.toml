@@ -1,10 +1,13 @@
 [project]
 name = "substance-designer-mcp"
-version = "0.1.0"
+version = "2.4.0"
 description = "MCP bridge server for Substance Designer"
 requires-python = ">=3.12"
 dependencies = [
-    "mcp[cli]>=1.10.0",
+    # Tested on 1.26.0; structured output (typed tool results) and Context
+    # progress reporting need recent 1.x. Keep <2 since major releases may
+    # change the FastMCP API this bridge relies on.
+    "mcp[cli]>=1.26.0,<2.0.0",
 ]
 
 [dependency-groups]

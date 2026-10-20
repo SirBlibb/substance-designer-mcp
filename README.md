@@ -10,7 +10,7 @@ Control Substance Designer from any MCP-compatible AI client (Claude Code, Claud
 
 - **Natural language → SD graph**: "Create a cracked concrete material" → 44-node PBR graph with height, normal, roughness, AO, baseColor, metallic outputs
 - **79 built-in material recipes**: pro-grade materials using the same node architecture as professional SD artists
-- **16 MCP tools**: get scene info, create/delete graphs, create nodes, connect nodes, set parameters, build full materials in one call
+- **42 MCP tools**: get scene info, create/delete graphs, create nodes, connect nodes, set parameters, build full materials in one call, health check, snapshot, and stage-tracked cancellable long jobs
 - **Library node support**: Clouds, Cells, Perlin Noise, Polygon, Edge Detect, Flood Fill, Multi-Directional Warp, etc.
 - **Thread-safe**: All SD API calls dispatched to Qt main thread via Signal/Slot queued connection
 
@@ -61,6 +61,7 @@ sd_mcp_plugin/
 ├── __init__.py          ← main plugin (TCP listener, all command handlers)
 ├── recipes.py           ← 79 material recipes
 ├── sd_documentation.py  ← embedded docs served by list_documentation
+├── texture_stats.py     ← pixel statistics reader (unit-tested outside SD)
 └── port_suggest.py      ← port-ID suggestions for connection errors
 ```
 
@@ -81,7 +82,7 @@ uv sync   # installs mcp[cli] into .venv
 
 Or with pip:
 ```bash
-pip install "mcp[cli]>=1.10.0"
+pip install "mcp[cli]>=1.26.0,<2.0.0"
 ```
 
 ### Step 3 — Configure Your MCP Client
@@ -146,6 +147,7 @@ List all available material recipes
 | `connect_nodes` | Connect two nodes via their ports (wrong port IDs fail with the valid IDs, closest match first) |
 | `disconnect_nodes` | Remove a connection |
 | `set_parameter` | Set a node parameter |
+| `set_parameters` | Apply several parameter edits across nodes in one call (per-update status) |
 | `get_node_info` | Get ports and parameters of a node |
 | `delete_node` | Delete a node |
 | `move_node` | Reposition a node |
@@ -157,9 +159,16 @@ List all available material recipes
 | `open_graph` | Open a graph in the SD editor |
 | `save_package` | Save the package to disk |
 | `capture_3d_view` | Return the SD 3D view as an image (to judge the material visually) |
+| `capture_2d_view` | Render a map or labeled output contact sheet in one call, or grab the SD 2D view |
+| `capture_node_preview` | Grab each node's graph-editor tile with SD's live thumbnail (no `graph.compute()`), for one node or a labeled multi-node contact sheet |
+| `get_map_stats` | Return per-channel min/max/mean and histogram from a computed texture's pixel buffer (histograms of >1M-pixel 16-bit/float maps are sample-counted, `histogram.sample_stride`) |
+| `inspect_outputs` | Contact sheet + per-channel stats for several outputs from one graph compute (~28 s for 4 outputs on 8192² maps) |
 | `send_to_3d_view` | Bind a graph's outputs to the 3D view material channels, without moving the mouse |
 | `list_documentation` | Browse/search the embedded SD knowledge base (nodes, ports, blend modes) |
-| `execute_sd_code` | Execute arbitrary Python in SD's context |
+| `diagnostic` | Read-only health check: SD version, Qt binding, packages, current graph, security gates |
+| `graph_snapshot` | Export a graph's nodes and connections as JSON |
+| `start_long_job` / `wait_long_job` / `get_job_status` / `cancel_long_job` | Run heavy inspection ops (inspect_outputs, get_map_stats, capture_2d_view, capture_node_preview) as stage-tracked jobs with progress notifications and between-stage cancellation |
+| `execute_sd_code` | Execute arbitrary Python in SD's context (**disabled by default** — see Security) |
 | `reload_plugin` | Hot-reload the plugin's Python code from disk (development) |
 | **`create_batch_graph`** | **Build a whole graph (nodes + connections) in one call** |
 | **`build_material_graph`** | **Build a full PBR material in one call** |
@@ -230,6 +239,80 @@ Input port 'input1' not found on node '1584398761' (sbs::compositing::output).
 Did you mean 'inputNodeOutput'? Valid input port IDs (closest first): ['inputNodeOutput'].
 ```
 
+Error recovery:
+
+```python
+create_batch_graph(..., preflight=True)
+# → {"preflight": true, "valid": false, "errors": [...], "warnings": [...]}
+#   Validates definitions, library URLs/keywords, parameter value shapes and
+#   atomic-node port IDs WITHOUT creating a graph (library node ports are only
+#   known after instancing, so those ports are skipped).
+
+create_batch_graph(..., cleanup_on_failure=True)
+# → deletes the new graph when a node or connection fails and raises with the
+#   report, leaving no half-built graph in your package. build_material_graph /
+#   build_heightmap_graph default to cleanup_on_failure=True.
+```
+
+---
+
+## Security
+
+The plugin accepts commands on a localhost TCP port and the bridge runs as an MCP stdio
+server on the same machine. Two opt-ins harden that:
+
+- **`execute_sd_code` is disabled by default.** Starting the bridge with
+  `--allow-arbitrary-code` (or `SD_MCP_ALLOW_EXECUTE_CODE=1` in its environment) arms the
+  MCP tool, but the plugin still refuses to run code unless SD's environment has
+  `SD_MCP_ALLOW_EXECUTE_CODE=1` or an `allow_execute_code` marker file exists in the plugin
+  folder. Both sides must agree. `diagnostic` reports the current state
+  (`execute_code_enabled`).
+- **`reload_plugin` is disabled by default.** It re-executes plugin Python from disk;
+  arm it with `--allow-dev-tools` (or `SD_MCP_ALLOW_DEV_TOOLS=1` for the bridge) plus
+  `SD_MCP_ALLOW_DEV_TOOLS=1` or the execute-code opt-in on the plugin side.
+- **Shared token:** start the bridge with `--token SECRET` and set `SD_MCP_TOKEN=SECRET`
+  in SD's environment. Every command then carries the token and unidentified localhost
+  callers are refused before dispatch (`token_auth_required` shows in `diagnostic`).
+  The plugin compares tokens in constant time. Without the env var set, the port stays
+  localhost-trust as before.
+
+`diagnostic` and `graph_snapshot` are read-only tools added for exactly this kind of
+health/inspection work.
+
+### Timeouts
+
+Socket waits are layered so a live plugin request is never abandoned by the client
+first:
+
+- `--timeout` (default 150 s) applies to ordinary commands;
+  `--heavy-timeout` (default 300 s) applies to builds, computes, captures,
+  `execute_code` and `save_package`.
+- Each command carries its timeout to the plugin, which waits slightly less
+  (`SD_MCP_COMMAND_TIMEOUT`, default 120, capped at 600 by
+  `SD_MCP_COMMAND_TIMEOUT_MAX`) and cancels queued work when it expires.
+- Commands are idempotent via a `request_id`, so bridge reconnect retries replay
+  the plugin's cached response instead of running the command twice.
+- The plugin serves each client on its own thread, so `job_status` /
+  `job_cancel` respond even while another request's `sd.api` call blocks SD's
+  main thread.
+
+### Long jobs
+
+Heavy inspection runs a `graph.compute()` that blocks SD's main thread for its whole
+duration and can exceed the bridge's heavy timeout on huge graphs. The blocking tools
+stay as-is; for very large graphs run the staged job variant instead:
+
+```python
+start_long_job(job_type="inspect_outputs", params={"graph_identifier": "Steel", "output_usages": ["height", "normal"]})
+# → {"job_id": 4, "started": true}
+wait_long_job(job_id=4)          # polls until done, emits MCP progress notifications per stage; returns the result
+cancel_long_job(job_id=4)        # stops between stages if needed
+```
+
+Stages run on SD's main thread (SD's constraint), so a single `compute()` stage cannot be
+interrupted mid-flight, but cancellation takes effect immediately after it, and status
+polls report stages (`compute → read_output → render_sheet → done`).
+
 ---
 
 ## Critical Rules (SD 15.x)
@@ -278,12 +361,24 @@ These are hard constraints of the SD 15.x API — violating them hangs or crashe
 - Check SD logs: `%LOCALAPPDATA%\Adobe\Adobe Substance 3D Designer\log.txt` (look for `[SD-MCP]`)
 - Verify the plugin is in the correct `sduserplugins` directory
 
+**"Unauthorized: token missing or incorrect":**
+- The bridge was started with `--token` but SD's `SD_MCP_TOKEN` differs (or the reverse).
+  Both sides must share the same value; restart accordingly.
+
 **SD hangs after a command:**
 - A bad node definition was likely used. Restart SD.
 - The plugin validates node definitions before calling SD, but library nodes need correct `pkg://` URLs.
 
 **Wrong port:**
 - Plugin listens on **9881** by default. Bridge must use `--port 9881`.
+- Both sides also read `SD_MCP_PORT` (the plugin accepts a comma-separated list);
+  `--port` overrides it on the bridge side.
+
+**Bridge times out while SD is still working:**
+- The plugin budget is derived from the command's timeout; raise `--timeout` /
+  `--heavy-timeout` on the bridge and `SD_MCP_COMMAND_TIMEOUT` /
+  `SD_MCP_COMMAND_TIMEOUT_MAX` in SD's environment together, keeping the
+  plugin's value lower than the bridge's.
 
 **Plugin not loading:**
 - Delete `__pycache__/` in the plugin directory and restart SD.

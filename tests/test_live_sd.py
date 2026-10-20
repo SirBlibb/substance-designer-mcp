@@ -3,6 +3,7 @@
 Read-only: they do not create or modify graphs.
 """
 import json
+import os
 
 import pytest
 
@@ -21,6 +22,28 @@ async def test_live_scene_info(client):
     result = await client.call_tool("get_scene_info", {})
     assert not result.isError, result.content[0].text
     assert isinstance(json.loads(result.content[0].text), dict)
+
+
+async def test_live_capture_node_preview(client):
+    scene = json.loads((await client.call_tool("get_scene_info", {})).content[0].text)
+    graph = scene["current_graph"]
+    info = json.loads((await client.call_tool(
+        "get_graph_info", {"graph_identifier": graph})).content[0].text)
+    node_id = info["nodes"][0]["identifier"]
+
+    result = await client.call_tool("capture_node_preview", {
+        "graph_identifier": graph,
+        "node_id": node_id,
+        "max_size": 128,
+        "return_image": False,
+    })
+    assert not result.isError, result.content[0].text
+    payload = json.loads(result.content[0].text)
+    assert payload["method"] == "node_preview"
+    assert payload["node"] == node_id
+    assert payload["width"] > 0 and payload["height"] > 0
+    assert os.path.isfile(payload["path"])
+    assert payload["capture"] in ("preview_widget", "graph_view_crop")
 
 
 async def test_live_unknown_node_is_tool_error(client):

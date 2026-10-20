@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-sd_mcp_bridge.py - Substance Designer MCP Bridge v2.0.0
+sd_mcp_bridge.py - Substance Designer MCP Bridge v2.4.0
 
 Relay between Claude (stdio/FastMCP) and the SD plugin (TCP).
 
@@ -8,6 +8,46 @@ Architecture: Claude -> stdio -> this bridge -> TCP localhost:<port> -> SD plugi
 
 Protocol: Length-prefix framing [4-byte big-endian length][JSON payload]
 Connection: Fresh TCP socket per command (no persistent connection)
+
+Added in v2.4.0:
+  capture_node_preview: grabs each node's graph-editor tile (with SD's live
+  thumbnail, no graph.compute()) for one node or a labeled multi-node contact
+  sheet. Also available as a staged long job.
+  execute_sd_code is disabled by default; enable with --allow-arbitrary-code
+  (bridge) and SD_MCP_ALLOW_EXECUTE_CODE=1 or an `allow_execute_code` marker
+  file in the plugin folder (plugin). --token adds a shared secret required
+  by the plugin when it runs with SD_MCP_TOKEN set. reload_plugin is likewise
+  disabled unless --allow-dev-tools (bridge) and SD_MCP_ALLOW_DEV_TOOLS=1 or
+  the execute-code opt-in (plugin) are set.
+  Timeouts are layered: --timeout (default 150s) and --heavy-timeout
+  (default 300s) are sent with each command; the plugin stops its main-thread
+  wait just before them. Commands carry a request_id, so the plugin can replay
+  a cached response instead of executing a duplicate. SD_MCP_PORT selects the
+  default plugin/bridge port. The plugin runs one worker per client, keeping
+  job polling/cancel responsive while sd.api blocks the main thread.
+  Several JSON tools now return MCP structured content (typed output schema):
+  create/get graph, create node, parameter updates, batch/recipe builds and
+  send_to_3d_view; the readable JSON text content is unchanged.
+  create_batch_graph gained preflight (validate without building) and
+  cleanup_on_failure (delete the new graph when the build fails).
+  New tools: diagnostic (health check), graph_snapshot (nodes + connections),
+  start_long_job / wait_long_job / get_job_status / cancel_long_job for
+  stage-tracked, cancellable heavy computes (inspect_outputs, get_map_stats,
+  capture_2d_view) with MCP progress notifications.
+
+Added in v2.3.0:
+  set_parameters: batch parameter edits across nodes in one call (the plugin
+  resolves the graph and each node once and reports per-update status)
+  inspect_outputs: one graph compute for both a labeled preview contact sheet
+  and per-channel statistics of several outputs
+
+Added in v2.2.0:
+  capture_2d_view tool: renders a single node/map (e.g. the Height output) as a
+  PNG at native resolution via the SD API, or grabs the 2D view widget
+  output_usages: captures multiple labeled outputs into one contact sheet
+  get_map_stats: returns per-channel pixel statistics and histograms (exact
+  min/max/mean; histograms of >1M-pixel 16-bit/float maps are sample-counted,
+  see histogram.sample_stride)
 
 Fixes in v2.0.0:
   BUG-B01: _send_lock no longer held across full retry loop (prevents 360s deadlock)
@@ -32,6 +72,7 @@ import argparse
 import asyncio
 import time
 import threading
+import uuid
 from typing import Any, Dict, List, Optional
 from contextlib import asynccontextmanager
 
@@ -44,7 +85,8 @@ if os.path.exists(venv_site):
 from mcp.server.fastmcp import FastMCP, Context, Image
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, ValidationError,
+                      model_validator)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,20 +97,62 @@ logger = logging.getLogger("SD_MCP_Bridge")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TIMEOUT = 120          # SD can be slow on heavy operations
+# Single source of truth for the bridge version; kept in sync with the
+# `version` field in server/pyproject.toml.
+BRIDGE_VERSION = "2.4.0"
+
+# The bridge must outwait the plugin's main-thread dispatch budget (120 s by
+# default); the plugin additionally stops RESPONSE_GRACE seconds earlier.
+TIMEOUT = 150          # default socket timeout for ordinary commands
+HEAVY_TIMEOUT = 300    # builds/computes/captures that legitimately run longer
 CONNECT_TIMEOUT = 5    # timeout for initial TCP connection
 HEADER_SIZE = 4
 MAX_RETRIES = 2        # only for connection failures, not SD operation timeouts
 RETRY_DELAY = 1.0      # seconds between retry attempts
 
+# Tools that may run longer than TIMEOUT. The plugin receives the chosen
+# timeout in the command envelope and sets its dispatch wait just below it.
+_HEAVY_TOOLS = frozenset({
+    "create_batch_graph", "build_material_graph", "build_heightmap_graph",
+    "apply_recipe", "inspect_outputs", "get_map_stats", "capture_2d_view",
+    "capture_node_preview", "capture_3d_view", "send_to_3d_view",
+    "execute_code", "save_package",
+})
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    for part in raw.split(","):
+        try:
+            return int(part.strip())
+        except (TypeError, ValueError):
+            continue
+    return default
+
+
+def _tool_timeout(cmd_type: str) -> float:
+    return HEAVY_TIMEOUT if cmd_type in _HEAVY_TOOLS else TIMEOUT
+
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
-_sd_port: int = 9881   # BUG-B03 fix: default matches SD plugin DEFAULT_PORTS
+_sd_port: int = _env_int("SD_MCP_PORT", 9881)   # BUG-B03: matches plugin default
 # BUG-B01 fix: lock is NOT held across the retry loop — only during the actual
 # socket operation. This prevents a single timeout from blocking the bridge for
 # 3 x 120 = 360 seconds. Each _send_command call acquires its own lock window.
 _send_lock = threading.Lock()
+
+# ── Security ────────────────────────────────────────────────────────────────
+# execute_sd_code is opt-in: set --allow-arbitrary-code (or the env var below).
+# The plugin enforces its own matching gate before running anything.
+_allow_arbitrary_code: bool = False
+# reload_plugin re-executes plugin code from disk; disabled by default.
+_allow_dev_tools: bool = False
+# Shared secret: when set, every command carries a "token" field. The plugin
+# rejects commands while SD_MCP_TOKEN is set and the token does not match.
+_auth_token: Optional[str] = None
+
 
 
 # ---------------------------------------------------------------------------
@@ -108,19 +192,28 @@ def _recv_framed(sock: socket.socket, timeout: float) -> bytes:
 # ---------------------------------------------------------------------------
 # Send command — BUG-B01/B10: lock held only for one connect+send+recv
 # ---------------------------------------------------------------------------
-def _send_command_locked(cmd_type: str, params: dict = None) -> dict:
+def _send_command_locked(cmd_type: str, params: dict = None,
+                         request_id: str = None, timeout: float = None) -> dict:
     """
     Open fresh TCP connection, send one command, receive one response.
     Lock is acquired INSIDE this function for the duration of the socket op.
-    This prevents a single timeout from holding the lock for 120+ seconds.
+    This prevents a single timeout from holding the lock for the full wait.
 
-    BUG-B10 fix: the lock now covers connect as well as send/recv. The plugin serves
-    connections one at a time in connect order, so connecting before taking the lock
-    let a waiting call queue up ahead of the lock holder: the plugin waited for the
-    waiting call's request while the lock holder waited for its reply (deadlock
-    until the 120s timeout, seen with parallel tool calls).
+    The command carries a request_id (the plugin caches the response and
+    replays it for a duplicate) and its timeout, so the plugin can stop its
+    main-thread wait just before the bridge gives up.
+
+    BUG-B10 fix: the lock covers connect as well as send/recv, so a waiting
+    call cannot connect and occupy the plugin's accept queue ahead of the lock
+    holder. With per-client plugin workers this is no longer a deadlock, but
+    keeping one in-flight command at a time still matches SD's contract.
     """
-    command = {"type": cmd_type, "params": params or {}}
+    timeout = float(timeout if timeout is not None else _tool_timeout(cmd_type))
+    request_id = request_id or uuid.uuid4().hex
+    command = {"type": cmd_type, "params": params or {},
+               "request_id": request_id, "timeout": timeout}
+    if _auth_token:
+        command["token"] = _auth_token
     data_out = json.dumps(command).encode("utf-8")
 
     with _send_lock:
@@ -136,14 +229,16 @@ def _send_command_locked(cmd_type: str, params: dict = None) -> dict:
 
         try:
             _send_framed(sock, data_out)
-            response_bytes = _recv_framed(sock, TIMEOUT)
+            response_bytes = _recv_framed(sock, timeout)
             if not response_bytes:
-                return {"status": "error", "message": f"Empty response from SD on '{cmd_type}'."}
+                return {"status": "error",
+                        "message": f"Empty response from SD on '{cmd_type}' "
+                                   f"(request {request_id})."}
             return json.loads(response_bytes.decode("utf-8"))
         except socket.timeout:
             return {"status": "error",
-                    "message": f"Timeout ({TIMEOUT}s) waiting for SD on '{cmd_type}'. "
-                               f"SD may be busy — try again."}
+                    "message": f"Timeout ({timeout}s) waiting for SD on '{cmd_type}' "
+                               f"(request {request_id}). SD may be busy — try again."}
         except json.JSONDecodeError as e:
             return {"status": "error", "message": f"Invalid JSON from SD: {e}"}
         except Exception as e:
@@ -155,9 +250,15 @@ def _send_command_locked(cmd_type: str, params: dict = None) -> dict:
                 pass
 
 
-def _request(cmd_type: str, params: dict = None) -> Any:
+def _request(cmd_type: str, params: dict = None, timeout: float = None,
+             request_id: str = None) -> Any:
     """
     Send one command and return its result.
+
+    request_id is generated once and reused across internal retries so the
+    plugin can deduplicate a command that was already executed. timeout is in
+    seconds; omitted means _tool_timeout(cmd_type) (default vs heavy profile).
+
     BUG-B01 fix: retry loop is OUTSIDE the lock (lock is inside _send_command_locked).
     BUG-B08 clarification: timeouts do NOT retry (would just re-queue a stuck SD op).
     BUG-B09 fix: retry ONLY when the TCP connect itself failed (ConnectionError raised
@@ -165,9 +266,11 @@ def _request(cmd_type: str, params: dict = None) -> Any:
     (e.g. a failed connect_nodes) was retried, re-running commands SD had already run.
     Raises ToolError on failure so MCP clients receive isError=true.
     """
+    request_id = request_id or uuid.uuid4().hex
     for attempt in range(MAX_RETRIES + 1):
         try:
-            response = _send_command_locked(cmd_type, params)
+            response = _send_command_locked(
+                cmd_type, params, request_id=request_id, timeout=timeout)
             break
         except ConnectionError as e:
             if attempt < MAX_RETRIES:
@@ -179,7 +282,19 @@ def _request(cmd_type: str, params: dict = None) -> Any:
         raise ToolError(response.get("message", "Unknown error"))
     result = response.get("result")
     # BUG-B07 fix: None result returns "{}" not "null"
-    return {} if result is None else result
+    result = {} if result is None else result
+
+    # Non-finite floats were replaced by the plugin with nulls plus explicit
+    # path flags; surface those flags so clients do not mistake them for data.
+    flags = response.get("non_finite_values")
+    if flags:
+        logger.warning(f"SD returned non-finite values on '{cmd_type}' (request "
+                       f"{request_id}): {flags}")
+        if isinstance(result, dict):
+            result.setdefault("non_finite_values", flags)
+        else:
+            result = {"result": result, "non_finite_values": flags}
+    return result
 
 
 def _send(cmd_type: str, params: dict = None) -> str:
@@ -191,12 +306,17 @@ async def _async_send(cmd_type: str, params: dict = None) -> str:
     return await asyncio.to_thread(_send, cmd_type, params)
 
 
+async def _async_data(cmd_type: str, params: dict = None) -> dict:
+    """Send a command and return its parsed result dict (for typed tools)."""
+    return await asyncio.to_thread(_request, cmd_type, params)
+
+
 # ---------------------------------------------------------------------------
 # FastMCP Server — BUG-B05 fix: lifespan passed at constructor
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def _lifespan(app: FastMCP):
-    logger.info(f"Substance Designer MCP Bridge v2.0.0 -> SD plugin on port {_sd_port}")
+    logger.info(f"Substance Designer MCP Bridge v{BRIDGE_VERSION} -> SD plugin on port {_sd_port}")
     logger.info("Ensure Substance Designer is running with the MCP plugin loaded.")
     yield {}
     logger.info("Substance Designer MCP bridge shutting down.")
@@ -218,14 +338,32 @@ Recommended workflow:
    port IDs (closest match first), so read the error and retry with the suggested ID.
    list_documentation(category="port_reference") lists known ports, and
    list_documentation(action="search", query=...) searches all docs.
-4. To check the result visually, open the 3D view in SD (F3), call
-   send_to_3d_view(graph) to show that graph's material there (no mouse control
-   needed), then capture_3d_view, which returns the rendered preview as an image. Iterate with
-   set_parameter, then capture again (refresh_first=True if the render looks stale).
+4. To check the result visually, capture_2d_view renders a single map straight
+   from the graph at native resolution - ideal for reviewing individual channels
+   (e.g. output_usage="height" or "normal"); without a node it grabs the 2D view
+   widget (open with F2). inspect_outputs combines a multi-output contact sheet
+   with numeric per-channel statistics from ONE graph compute - prefer it over
+   several capture_2d_view/get_map_stats calls. To review node thumbnails without
+   a compute, capture_node_preview grabs each node's tile from the graph editor
+   (one node or a labeled sheet of node_ids). For a full material preview,
+   open the 3D view in SD (F3), call send_to_3d_view(graph) to show that graph's
+   material there (no mouse control needed), then capture_3d_view, which returns
+   the rendered preview as an image. Iterate with set_parameters (several
+   properties in one call) or set_parameter, then capture again
+   (refresh_first=True if the render looks stale).
 5. Changes are in memory until save_package is called.
 
-execute_sd_code runs arbitrary Python on SD's main thread and freezes SD while it
-runs; use it only when no dedicated tool fits, and keep the code short.
+When a build fails, retry with preflight=True on create_batch_graph first; for
+already-created partial graphs prefer cleanup_on_failure=True next time.
+
+execute_sd_code and reload_plugin are disabled by default - ask the user to
+restart the bridge with --allow-arbitrary-code or --allow-dev-tools and to set
+the matching plugin-side gate before relying on them. diagnostic is a read-only
+health check useful after unexpected failures.
+For very large graphs, heavy inspection tools can run as cancellable, stage-
+tracked jobs: start_long_job -> wait_long_job (progress notifications) /
+cancel_long_job instead of the direct blocking inspect_outputs/get_map_stats/
+capture_2d_view/capture_node_preview calls.
 """
 
 # BUG-B05 fix: pass lifespan at construction (not post-construction attribute)
@@ -285,6 +423,23 @@ class BatchNode(BaseModel):
     parameters: Optional[ParamOverrides] = Field(None, description=_PARAMS_DESC)
 
 
+class BatchParameter(BaseModel):
+    """One parameter update in set_parameters."""
+    model_config = ConfigDict(extra="allow")
+
+    node_id: str = Field(
+        ..., description="Node identifier or node label to update.")
+    parameter_id: str = Field(
+        ..., description="Parameter/property ID on that node (same IDs and "
+                         "aliases as set_parameter).")
+    value: Any = Field(
+        ..., description="Value to set; type inferred per value_type.")
+    value_type: str = Field(
+        "float", description="'float', 'int', 'bool', 'string', 'float2', "
+                             "'float3', 'float4', 'color' (RGBA 0-1), 'int2', "
+                             "'int3', 'int4'.")
+
+
 class BatchConnection(BaseModel):
     """One connection to make in create_batch_graph."""
     model_config = ConfigDict(extra="allow")
@@ -309,6 +464,158 @@ class BatchConnection(BaseModel):
 def _dump(items) -> list:
     """Pydantic models -> plain dicts for the plugin (aliased keys, unset Nones dropped)."""
     return [i.model_dump(by_alias=True, exclude_none=True) for i in items or []]
+
+
+# ---------------------------------------------------------------------------
+# Typed tool outputs. The plugin returns plain dicts; these lenient models
+# (extra="allow", everything optional unless the plugin guarantees it) give
+# MCP clients a validated structuredContent alongside the JSON text content.
+# ---------------------------------------------------------------------------
+_JsonObj = Dict[str, Any]
+
+
+def _typed(model_cls: type, data: dict) -> Any:
+    """Validate a plugin result into a typed output model.
+
+    Raises ToolError carrying the raw JSON so nothing is lost when the plugin
+    returns an unexpected shape.
+    """
+    try:
+        return model_cls.model_validate(data)
+    except ValidationError as exc:
+        raise ToolError(
+            "Structured result validation failed for {}. "
+            "Raw result:\n{}".format(model_cls.__name__, json.dumps(data, indent=2))
+        ) from exc
+
+
+class GraphInfoResult(BaseModel):
+    """Output of get_graph_info."""
+    model_config = ConfigDict(extra="allow")
+
+    identifier: str = Field(..., description="Graph identifier.")
+    node_count: int = 0
+    truncated: Optional[bool] = None
+    node_limit: Optional[int] = None
+    nodes: List[_JsonObj] = Field(default_factory=list)
+
+
+class NodeCreatedResult(BaseModel):
+    """Output of create_node."""
+    model_config = ConfigDict(extra="allow")
+
+    node_id: str
+    definition: Optional[str] = None
+    position: Optional[List[float]] = None
+
+
+class CreateGraphResult(BaseModel):
+    """Output of create_graph."""
+    model_config = ConfigDict(extra="allow")
+
+    identifier: str = Field(..., description="Sanitized graph identifier.")
+    requested_name: Optional[str] = None
+    sanitized_name: Optional[str] = None
+    type: Optional[str] = None
+    package: Optional[str] = None
+
+
+class ParameterUpdateResult(BaseModel):
+    """One update inside set_parameter/set_parameters results.
+
+    Only keys the plugin always sends are declared; conditional keys
+    (status/error on failures, renamed_from on renames) flow through as
+    extras so the structured dump mirrors the plugin's JSON exactly.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    node_id: str
+    parameter_id: str
+    value: Any = None
+    value_type: Optional[str] = None
+
+
+class SetParametersResult(BaseModel):
+    """Output of set_parameters."""
+    model_config = ConfigDict(extra="allow")
+
+    graph: str
+    applied: int = 0
+    failed: int = 0
+    results: List[ParameterUpdateResult] = Field(default_factory=list)
+
+
+class BatchGraphResult(BaseModel):
+    """Output of create_batch_graph / build_material_graph /
+    build_heightmap_graph for an executed build. Only keys the plugin always
+    sends are declared; conditional keys (param_warnings, future additions)
+    stay extras so the structured dump mirrors the plugin's JSON exactly.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    graph_identifier: str
+    requested_name: str
+    nodes_created: int = 0
+    nodes_failed: int = 0
+    connections_ok: int = 0
+    connections_failed: int = 0
+    node_map: Dict[str, str] = Field(default_factory=dict)
+    nodes: List[_JsonObj] = Field(default_factory=list)
+    failed_nodes: List[_JsonObj] = Field(default_factory=list)
+    connections: List[_JsonObj] = Field(default_factory=list)
+
+
+class BatchPreflightResult(BaseModel):
+    """Output of create_batch_graph(preflight=True) — nothing is created."""
+    model_config = ConfigDict(extra="allow")
+
+    preflight: bool = True
+    requested_name: str
+    graph_name: str
+    valid: bool
+    errors: List[_JsonObj] = Field(default_factory=list)
+    warnings: List[_JsonObj] = Field(default_factory=list)
+    error_count: int = 0
+    warning_count: int = 0
+    nodes_checked: int = 0
+    connections_checked: int = 0
+
+
+class BatchBuildResult(BaseModel):
+    """Return annotation of create_batch_graph / build_*.
+
+    Union return annotations get wrapped as {"result": ...} by FastMCP, so
+    the tools validate against the concrete class (BatchGraphResult or
+    BatchPreflightResult) and return the plugin's raw dict; this permissive
+    pass-through model then produces structuredContent byte-equal to it.
+    """
+    model_config = ConfigDict(extra="allow")
+
+
+class ApplyRecipeResult(BaseModel):
+    """Output of apply_recipe (nodes are added to an existing graph)."""
+    model_config = ConfigDict(extra="allow")
+
+    graph_identifier: str
+    recipe: str
+    nodes_added: int = 0
+    nodes_failed: int = 0
+    connections_ok: int = 0
+    connections_failed: int = 0
+    node_map: Dict[str, str] = Field(default_factory=dict)
+
+
+class Send3DStatusResult(BaseModel):
+    """Output of send_to_3d_view (and its status calls)."""
+    model_config = ConfigDict(extra="allow")
+
+    job_id: int
+    graph: Optional[str] = None
+    done: bool = False
+    bound: List[_JsonObj] = Field(default_factory=list)
+    failed: List[_JsonObj] = Field(default_factory=list)
+    pending: List[_JsonObj] = Field(default_factory=list)
+    skipped: List[_JsonObj] = Field(default_factory=list)
 
 
 # ======================================================================
@@ -340,11 +647,11 @@ async def create_package(ctx: Context) -> str:
     return await _async_send("create_package")
 
 
-@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+@mcp.tool(annotations=_ADDITIVE)
 async def create_graph(ctx: Context,
                        package_index: int = 0,
                        graph_name: str = "MCP_Graph",
-                       package_path: Optional[str] = None) -> str:
+                       package_path: Optional[str] = None) -> CreateGraphResult:
     """
     Create a new SBS Compositing Graph in Substance Designer.
     - package_index: which loaded package (0 = first/current)
@@ -354,11 +661,12 @@ async def create_graph(ctx: Context,
     IMPORTANT: graph_name should use only letters, digits, underscores.
     Spaces and special characters are automatically sanitized.
     """
-    return await _async_send("create_graph", {
+    data = await _async_data("create_graph", {
         "package_index": package_index,
         "graph_name": graph_name,
         "package_path": package_path,
     })
+    return _typed(CreateGraphResult, data)
 
 
 @mcp.tool(annotations=_DESTRUCTIVE, structured_output=False)
@@ -378,11 +686,11 @@ async def open_graph(ctx: Context, graph_identifier: str) -> str:
     return await _async_send("open_graph", {"graph_identifier": graph_identifier})
 
 
-@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+@mcp.tool(annotations=_READ_ONLY)
 async def get_graph_info(ctx: Context,
                          graph_identifier: Optional[str] = None,
                          node_limit: int = 100,
-                         include_connections: bool = True) -> str:
+                         include_connections: bool = True) -> GraphInfoResult:
     """
     Get detailed info about a graph including all nodes and connections.
     - graph_identifier: graph identifier (None = current active graph)
@@ -392,11 +700,12 @@ async def get_graph_info(ctx: Context,
     For large graphs (100+ nodes), use node_limit=0 to get just the count,
     then query specific nodes with get_node_info.
     """
-    return await _async_send("get_graph_info", {
+    data = await _async_data("get_graph_info", {
         "graph_identifier": graph_identifier,
         "node_limit": node_limit,
         "include_connections": include_connections,
     })
+    return _typed(GraphInfoResult, data)
 
 
 @mcp.tool(annotations=_READ_ONLY, structured_output=False)
@@ -422,11 +731,11 @@ async def list_node_definitions(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+@mcp.tool(annotations=_ADDITIVE)
 async def create_node(ctx: Context,
                       definition_id: str,
                       graph_identifier: Optional[str] = None,
-                      position: Optional[List[float]] = None) -> str:
+                      position: Optional[List[float]] = None) -> NodeCreatedResult:
     """
     Create an atomic node in a Substance Designer graph.
     - definition_id: e.g. 'sbs::compositing::blend', 'sbs::compositing::levels'
@@ -458,11 +767,12 @@ async def create_node(ctx: Context,
 
     Returns node_id which is used in connect_nodes, set_parameter, etc.
     """
-    return await _async_send("create_node", {
+    data = await _async_data("create_node", {
         "definition_id": definition_id,
         "graph_identifier": graph_identifier,
         "position": position,
     })
+    return _typed(NodeCreatedResult, data)
 
 
 @mcp.tool(annotations=_ADDITIVE, structured_output=False)
@@ -571,13 +881,13 @@ async def disconnect_nodes(ctx: Context,
     })
 
 
-@mcp.tool(annotations=_UPDATE, structured_output=False)
+@mcp.tool(annotations=_UPDATE)
 async def set_parameter(ctx: Context,
                         node_id: str,
                         parameter_id: str,
                         value: Any,
                         value_type: str = "float",
-                        graph_identifier: Optional[str] = None) -> str:
+                        graph_identifier: Optional[str] = None) -> ParameterUpdateResult:
     """
     Set a parameter on a node in Substance Designer.
     - node_id: target node identifier
@@ -605,13 +915,42 @@ async def set_parameter(ctx: Context,
                   'color' (RGBA 0-1), 'int2', 'int3', 'int4'
     - graph_identifier: target graph (None = current)
     """
-    return await _async_send("set_parameter", {
+    data = await _async_data("set_parameter", {
         "node_id": node_id,
         "parameter_id": parameter_id,
         "value": value,
         "value_type": value_type,
         "graph_identifier": graph_identifier,
     })
+    return _typed(ParameterUpdateResult, data)
+
+
+@mcp.tool(annotations=_UPDATE)
+async def set_parameters(ctx: Context,
+                         updates: List[BatchParameter],
+                         graph_identifier: Optional[str] = None) -> SetParametersResult:
+    """
+    Set several parameters across one or more nodes in ONE call.
+
+    The plugin resolves the graph and each node once and applies every update,
+    so an edit -> inspect -> adjust loop needs one call instead of one per
+    property. Failures are reported per update (status "ok"/"error") and do
+    not abort the batch.
+
+    updates: list of {node_id, parameter_id, value, value_type?} objects using
+    the same parameter IDs, aliases and value types as set_parameter. Example:
+      [{"node_id": "Base_Noise", "parameter_id": "disorder", "value": 0.4},
+       {"node_id": "Controls", "parameter_id": "color",
+        "value": [0.8, 0.2, 0.1], "value_type": "color"}]
+
+    Returns {graph, applied, failed, results: [{node_id, parameter_id, value,
+    value_type, status, error?, renamed_from?}...]}.
+    """
+    data = await _async_data("set_parameters", {
+        "updates": _dump(updates),
+        "graph_identifier": graph_identifier,
+    })
+    return _typed(SetParametersResult, data)
 
 
 @mcp.tool(annotations=_READ_ONLY, structured_output=False)
@@ -772,13 +1111,28 @@ async def arrange_nodes(ctx: Context,
 @mcp.tool(annotations=_ARBITRARY, structured_output=False)
 async def execute_sd_code(ctx: Context, code: str) -> str:
     """
-    Execute arbitrary Python code in Substance Designer's main thread (safe).
+    Execute arbitrary Python code in Substance Designer's main thread.
+
+    DISABLED BY DEFAULT. Run the bridge with
+      --allow-arbitrary-code
+    (or env SD_MCP_ALLOW_EXECUTE_CODE=1) to enable this tool. The plugin
+    enforces its own matching gate: SD_MCP_ALLOW_EXECUTE_CODE=1 in SD's
+    environment, or an 'allow_execute_code' marker file in the plugin folder
+    (%USERPROFILE%\\Documents\\Adobe\\Adobe Substance 3D Designer\\python\\
+    sduserplugins\\sd_mcp_plugin\\allow_execute_code). Both sides must agree.
+
     Variables available: sd, app, pkg_mgr, ui_mgr, open_in_editor
     Returns stdout, stderr, and any error.
-
-    WARNING: No timeout protection. Blocking code will hang SD indefinitely.
-    Keep code short, simple, and non-blocking.
+    WARNING: No timeout protection. Blocking code will hang SD indefinitely;
+    keep code short, simple, and non-blocking.
     """
+    if not _allow_arbitrary_code:
+        raise ToolError(
+            "execute_sd_code is disabled by default. Restart the bridge with "
+            "--allow-arbitrary-code (or set SD_MCP_ALLOW_EXECUTE_CODE=1) and "
+            "enable the plugin-side gate (SD_MCP_ALLOW_EXECUTE_CODE=1 in "
+            "SD's environment, or an 'allow_execute_code' file in the plugin "
+            "folder), then retry. Prefer a dedicated tool when one exists.")
     return await _async_send("execute_code", {"code": code})
 
 
@@ -818,11 +1172,193 @@ async def capture_3d_view(ctx: Context,
     return content
 
 
-@mcp.tool(annotations=_UPDATE, structured_output=False)
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def capture_2d_view(ctx: Context,
+                          graph_identifier: Optional[str] = None,
+                          node_id: Optional[str] = None,
+                          output_usage: Optional[str] = None,
+                          output_usages: Optional[List[str]] = None,
+                          port_id: Optional[str] = None,
+                          max_size: int = 1024,
+                          output_path: Optional[str] = None,
+                          wait_ms: int = 600,
+                          return_image: bool = True) -> list:
+    """
+    Capture a single map of a graph (e.g. the Height output) as an image.
+
+    Two modes:
+    - Texture mode (node_id or output_usage given): the plugin calls
+      graph.compute(), reads that node's output texture through the SD API and
+      returns it as a PNG - exact pixels, downscaled to max_size. No UI
+      interaction; works while SD is occluded. Ideal to review one map:
+      capture_2d_view(graph_identifier="X", output_usage="height").
+    - Widget mode (neither given): grabs the visible 2D view widget - what SD
+      shows, including tiling/zoom/selection preview. Open the 2D view (F2)
+      first; if graph_identifier is given, that graph's tab is opened first.
+
+    - graph_identifier: graph name as shown in the Explorer (None = current)
+    - node_id: any node (e.g. a mid-graph node) whose output map to render
+    - output_usage: OUTPUT node label to render, e.g. "height", "normal",
+      "Base Color", "ambientOcclusion", "ao" (case/space-insensitive)
+    - output_usages: render several OUTPUT labels into one labeled contact
+      sheet, e.g. ["height", "normal", "ambientOcclusion", "baseColor"].
+      Cannot be combined with node_id or output_usage.
+    - port_id: disambiguates nodes with several texture outputs
+    - max_size: longest side of the returned PNG (0 = native resolution)
+    - output_path: where to save the PNG
+      (default: %TEMP%/sd_mcp_preview/2dview_*.png)
+    - wait_ms: settle time in ms after switching the editor tab (widget mode)
+    - return_image: include the PNG in the response (default True)
+
+    Returns JSON {path, width, height, method, ...} followed by the image.
+    """
+    result = await asyncio.to_thread(_request, "capture_2d_view", {
+        "graph_identifier": graph_identifier,
+        "node_id": node_id,
+        "output_usage": output_usage,
+        "output_usages": output_usages,
+        "port_id": port_id,
+        "max_size": max_size,
+        "output_path": output_path,
+        "wait_ms": wait_ms,
+    })
+    content: list = [json.dumps(result, indent=2)]
+    path = result.get("path") if isinstance(result, dict) else None
+    if return_image and path and os.path.isfile(path):
+        content.append(Image(path=path))
+    return content
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def capture_node_preview(ctx: Context,
+                               graph_identifier: Optional[str] = None,
+                               node_id: Optional[str] = None,
+                               node_ids: Optional[List[str]] = None,
+                               max_size: int = 512,
+                               output_path: Optional[str] = None,
+                               wait_ms: int = 250,
+                               return_image: bool = True) -> list:
+    """
+    Capture the graph editor's node preview thumbnail (no graph.compute()).
+
+    Grabs each node's tile from the visible graph view, so this is much faster
+    than capture_2d_view(node_id=...) and also works for nodes that are not
+    connected to a graph output. The graph tab must be open in SD; each node is
+    focused briefly so its tile is in view. SD 15 renders previews in the graph
+    scene, so the tile crop is the normal path; a graph-owned preview widget is
+    used when present. Each node is fitted into view for a consistent crop, then
+    the original zoom and scroll position are restored.
+
+    - graph_identifier: graph name as shown in the Explorer (None = current)
+    - node_id: one node to capture
+    - node_ids: several nodes captured into one labeled contact sheet (max 32)
+    - max_size: longest side of each preview image (0 = native)
+    - output_path: where to save the PNG
+      (default: %TEMP%/sd_mcp_preview/node_preview_*.png)
+    - wait_ms: settle time in ms after opening/focusing each node
+    - return_image: include the PNG in the response (default True)
+
+    Returns JSON {path, width, height, method, capture, graph, node, label, ...}
+    for one node, or a contact-sheet result with items + skipped for several.
+    """
+    result = await asyncio.to_thread(_request, "capture_node_preview", {
+        "graph_identifier": graph_identifier,
+        "node_id": node_id,
+        "node_ids": node_ids,
+        "max_size": max_size,
+        "output_path": output_path,
+        "wait_ms": wait_ms,
+    })
+    content: list = [json.dumps(result, indent=2)]
+    path = result.get("path") if isinstance(result, dict) else None
+    if return_image and path and os.path.isfile(path):
+        content.append(Image(path=path))
+    return content
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def get_map_stats(ctx: Context,
+                        graph_identifier: Optional[str] = None,
+                        node_id: Optional[str] = None,
+                        output_usage: Optional[str] = None,
+                        port_id: Optional[str] = None,
+                        histogram_bins: int = 16) -> str:
+    """
+    Return per-channel min, max, mean and histogram values for a computed
+    node output texture.
+
+    Pass exactly one of node_id or output_usage. Integer formats are normalized
+    to 0..1; floating-point formats retain their stored values. Histograms use
+    each channel's observed finite min/max range; min/max/mean/count are always
+    exact, while histograms of 16-bit/float maps larger than ~1M pixels are
+    counted from evenly strided samples (histogram.sample_stride reports the
+    stride; 1 = every pixel counted).
+    """
+    return await _async_send("get_map_stats", {
+        "graph_identifier": graph_identifier,
+        "node_id": node_id,
+        "output_usage": output_usage,
+        "port_id": port_id,
+        "histogram_bins": histogram_bins,
+    })
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def inspect_outputs(ctx: Context,
+                          graph_identifier: Optional[str] = None,
+                          output_usages: Optional[List[str]] = None,
+                          max_size: int = 1024,
+                          histogram_bins: int = 16,
+                          output_path: Optional[str] = None,
+                          return_image: bool = True) -> list:
+    """
+    Inspect several graph outputs in ONE call: a labeled preview contact sheet
+    plus per-channel numeric statistics, both from a single graph compute.
+
+    capture_2d_view(output_usages=...) and get_map_stats each compute the graph
+    on their own; this combined tool computes once and reads the preview tiles
+    and the pixel buffers from the same computed textures. Outputs that cannot
+    be matched or read are listed under "skipped" instead of failing the call.
+
+    - graph_identifier: graph name as shown in the Explorer (None = current)
+    - output_usages: OUTPUT node labels, e.g. ["height", "normal", "ao",
+      "baseColor"] (case/space-insensitive; "ao" maps to ambientOcclusion).
+      Default: height, normal, ambientOcclusion, baseColor.
+    - max_size: longest side of each preview tile (0 = native resolution)
+    - histogram_bins: histogram bucket count per channel (1..512)
+    - output_path: where to save the contact sheet PNG
+      (default: %TEMP%/sd_mcp_preview/inspect_outputs_*.png)
+    - return_image: include the PNG in the response (default True)
+
+    min/max/mean/count are exact; histograms of 16-bit/float maps larger than
+    ~1M pixels are counted from evenly strided samples (histogram.sample_stride
+    reports the stride; 1 = every pixel counted).
+
+    Returns JSON {graph, path, width, height, histogram_bins, columns, rows,
+    outputs: [{usage, label, node, port_id, source_width, source_height,
+    width, height, pixel_format, value_domain, channels: {<channel>: {min,
+    max, mean, count, non_finite, histogram}}}], skipped} followed by the
+    image.
+    """
+    result = await asyncio.to_thread(_request, "inspect_outputs", {
+        "graph_identifier": graph_identifier,
+        "output_usages": output_usages,
+        "max_size": max_size,
+        "histogram_bins": histogram_bins,
+        "output_path": output_path,
+    })
+    content: list = [json.dumps(result, indent=2)]
+    path = result.get("path") if isinstance(result, dict) else None
+    if return_image and path and os.path.isfile(path):
+        content.append(Image(path=path))
+    return content
+
+
+@mcp.tool(annotations=_UPDATE)
 async def send_to_3d_view(ctx: Context,
                           graph_identifier: str,
                           channels: Optional[Dict[str, str]] = None,
-                          timeout_s: float = 90.0) -> str:
+                          timeout_s: float = 90.0) -> Send3DStatusResult:
     """
     Show a graph's material in the SD 3D view by binding its output nodes to
     the 3D view material channels (what right-click -> "View In 3D View" does).
@@ -856,10 +1392,10 @@ async def send_to_3d_view(ctx: Context,
     else:
         status = dict(status, note="Timed out waiting; the job may still be "
                                    "running inside SD.")
-    return json.dumps(status, indent=2)
+    return _typed(Send3DStatusResult, status)
 
 
-@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+@mcp.tool(annotations=_ADDITIVE)
 async def create_batch_graph(ctx: Context,
                              graph_name: str,
                              package_index: int = 0,
@@ -867,7 +1403,9 @@ async def create_batch_graph(ctx: Context,
                              connections: Optional[List[BatchConnection]] = None,
                              output_size_log2: int = 11,
                              open_in_editor: bool = True,
-                             package_path: Optional[str] = None) -> str:
+                             package_path: Optional[str] = None,
+                             preflight: bool = False,
+                             cleanup_on_failure: bool = False) -> BatchBuildResult:
     """
     Create a complete graph from a descriptor in ONE call. Most efficient for complex graphs.
 
@@ -899,10 +1437,20 @@ async def create_batch_graph(ctx: Context,
         nodes a wrong port ID fails that connection, and its error lists the
         valid port IDs (closest match first) so you can reconnect.
 
+    Recovery options:
+      - preflight: validate WITHOUT creating anything — resolves the package,
+        node definitions, library URLs/keywords, connection aliases and port
+        names (atomic nodes use the known port registry; library node ports
+        can only be known after instancing). Returns valid/errors/warnings,
+        no editor changes.
+      - cleanup_on_failure: delete the newly created graph when any node or
+        connection fails, leaving the package untouched, and raise an error
+        with the report.
+
     Returns: node_map {alias -> actual_node_id} + creation stats, plus a
     per-connection list with the resolved ports or the error.
     """
-    return await _async_send("create_batch_graph", {
+    data = await _async_data("create_batch_graph", {
         "graph_name": graph_name,
         "package_index": package_index,
         "nodes": _dump(nodes),
@@ -910,7 +1458,11 @@ async def create_batch_graph(ctx: Context,
         "output_size_log2": output_size_log2,
         "open_in_editor": open_in_editor,
         "package_path": package_path,
+        "preflight": preflight,
+        "cleanup_on_failure": cleanup_on_failure,
     })
+    _typed(BatchPreflightResult if preflight else BatchGraphResult, data)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -936,7 +1488,7 @@ async def get_recipe_info(ctx: Context, recipe_name: str) -> str:
     return await _async_send("get_recipe_info", {"recipe_name": recipe_name})
 
 
-@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+@mcp.tool(annotations=_ADDITIVE)
 async def build_material_graph(ctx: Context,
                                 graph_name: str,
                                 recipe_name: str,
@@ -944,7 +1496,9 @@ async def build_material_graph(ctx: Context,
                                 overrides: Optional[Dict[str, ParamOverrides]] = None,
                                 output_size_log2: int = 11,
                                 open_in_editor: bool = True,
-                                package_path: Optional[str] = None) -> str:
+                                package_path: Optional[str] = None,
+                                cleanup_on_failure: bool = True,
+                                 preflight: bool = False) -> BatchBuildResult:
     """
     Build a complete PBR material graph from a named recipe in ONE call.
 
@@ -960,8 +1514,11 @@ async def build_material_graph(ctx: Context,
     overrides: optional parameter overrides keyed by recipe node alias, e.g.
       {"<alias>": {"intensity": 8.0}} (get_recipe_info lists the aliases).
     output_size_log2: 10=1024, 11=2048, 12=4096
+    cleanup_on_failure: delete the new graph if the build fails (default True —
+      a failed recipe build leaves no half-built graph behind).
+    preflight: validate definitions/ports/aliases first without building.
     """
-    return await _async_send("build_material_graph", {
+    data = await _async_data("build_material_graph", {
         "graph_name": graph_name,
         "recipe_name": recipe_name,
         "package_index": package_index,
@@ -969,10 +1526,14 @@ async def build_material_graph(ctx: Context,
         "output_size_log2": output_size_log2,
         "open_in_editor": open_in_editor,
         "package_path": package_path,
+        "cleanup_on_failure": cleanup_on_failure,
+        "preflight": preflight,
     })
+    _typed(BatchPreflightResult if preflight else BatchGraphResult, data)
+    return data
 
 
-@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+@mcp.tool(annotations=_ADDITIVE)
 async def build_heightmap_graph(ctx: Context,
                                  graph_name: str,
                                  style: str,
@@ -982,7 +1543,9 @@ async def build_heightmap_graph(ctx: Context,
                                  detail_level: int = 2,
                                  scale: float = 5.0,
                                  disorder: float = 0.5,
-                                 package_path: Optional[str] = None) -> str:
+                                 package_path: Optional[str] = None,
+                                 cleanup_on_failure: bool = True,
+                                preflight: bool = False) -> BatchBuildResult:
     """
     Build a heightmap-only graph for terrain/rock/cliff.
 
@@ -991,8 +1554,10 @@ async def build_heightmap_graph(ctx: Context,
     detail_level: 1=basic, 2=standard, 3=high detail
     scale: overall scale factor (1.0 to 10.0)
     disorder: amount of irregularity/warping (0.0 to 1.0)
+    cleanup_on_failure: delete the new graph if the build fails (default True).
+    preflight: validate definitions/ports/aliases first without building.
     """
-    return await _async_send("build_heightmap_graph", {
+    data = await _async_data("build_heightmap_graph", {
         "graph_name": graph_name,
         "style": style,
         "package_index": package_index,
@@ -1002,15 +1567,19 @@ async def build_heightmap_graph(ctx: Context,
         "scale": scale,
         "disorder": disorder,
         "package_path": package_path,
+        "cleanup_on_failure": cleanup_on_failure,
+        "preflight": preflight,
     })
+    _typed(BatchPreflightResult if preflight else BatchGraphResult, data)
+    return data
 
 
-@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+@mcp.tool(annotations=_ADDITIVE)
 async def apply_recipe(ctx: Context,
                         recipe_name: str,
                         graph_identifier: Optional[str] = None,
                         position_offset: Optional[List[float]] = None,
-                        overrides: Optional[Dict[str, ParamOverrides]] = None) -> str:
+                        overrides: Optional[Dict[str, ParamOverrides]] = None) -> ApplyRecipeResult:
     """
     Apply a recipe to an EXISTING graph (adds nodes + connections to current graph).
     Useful for layering multiple materials or adding detail passes.
@@ -1021,12 +1590,13 @@ async def apply_recipe(ctx: Context,
     overrides: parameter overrides keyed by recipe node alias, e.g.
       {"<alias>": {"intensity": 8.0}} (get_recipe_info lists the aliases)
     """
-    return await _async_send("apply_recipe", {
+    data = await _async_data("apply_recipe", {
         "recipe_name": recipe_name,
         "graph_identifier": graph_identifier,
         "position_offset": position_offset,
         "overrides": overrides,
     })
+    return _typed(ApplyRecipeResult, data)
 
 
 @mcp.tool(annotations=_READ_ONLY, structured_output=False)
@@ -1083,25 +1653,216 @@ async def reload_plugin(ctx: Context, handlers: bool = True) -> str:
     - handlers: also reload the command handlers (plugin __init__.py). False
       reloads only the recipes, documentation and port-suggestion modules.
 
+    Disabled by default because it re-executes Python from disk. Start the
+    bridge with --allow-dev-tools and set SD_MCP_ALLOW_DEV_TOOLS=1 in SD's
+    environment (or use the execute_code opt-in) to enable it on both sides.
+
     The TCP server and main-thread dispatcher are kept, so changes to those
     still need an SD restart. Bridge (MCP server) changes need a client restart.
     """
+    if not _allow_dev_tools:
+        raise ToolError(
+            "reload_plugin is disabled by default. Restart the bridge with "
+            "--allow-dev-tools and enable SD_MCP_ALLOW_DEV_TOOLS=1 in SD's "
+            "environment (or the execute_code opt-in) on the plugin side.")
     return await _async_send("reload_plugin", {"handlers": handlers})
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def diagnostic(ctx: Context) -> str:
+    """
+    Full health check of the SD environment: SD version, Qt binding and
+    invoker, user packages, library cache, current graph, and whether the
+    execute_code gate and token auth are required on the plugin side.
+
+    Run this when tools report failures - it is a read-only report with no
+    side effects.
+    """
+    return await _async_send("diagnostic", {})
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def graph_snapshot(ctx: Context,
+                         graph_identifier: Optional[str] = None) -> str:
+    """
+    Export a graph's full structure as JSON: every node (id, definition,
+    position, is_library) and every connection (from_node/from_output ->
+    to_node/to_input). Good for diffing or re-documenting a graph.
+
+    - graph_identifier: graph name as shown in the Explorer (None = current)
+    """
+    return await _async_send("graph_snapshot", {
+        "graph_identifier": graph_identifier,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Long jobs: stage-tracked, cancellable versions of the heavy computes
+# (inspect_outputs, get_map_stats, capture_2d_view, capture_node_preview).
+# The plugin steps each op
+# through stages on its main thread (compute, conversions, save) so status
+# polls can interleave; wait_long_job turns stage changes into MCP progress
+# notifications. cancellation is checked between stages.
+# ---------------------------------------------------------------------------
+
+_JOB_OPS = ("inspect_outputs", "get_map_stats", "capture_2d_view",
+            "capture_node_preview")
+
+
+@mcp.tool(annotations=_UPDATE, structured_output=False)
+async def start_long_job(ctx: Context,
+                         job_type: str,
+                         params: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Start a heavy operation as a stage-tracked job and return {job_id, op}
+    immediately instead of running it to completion synchronously.
+
+    - job_type: one of "inspect_outputs", "get_map_stats", "capture_2d_view",
+      "capture_node_preview" (same parameters as the direct tools;
+      wait_long_job reports progress and returns the same result shape)
+    - params: keyword arguments of that tool, e.g. {"graph_identifier": "Steel",
+      "output_usages": ["height", "normal"]}
+
+    poll wait_long_job(job_id) until done is True; cancel_long_job stops it
+    between stages. Prefer the direct tools for small graphs.
+    """
+    if job_type not in _JOB_OPS:
+        raise ToolError(
+            "Unknown job_type '{}'. Available: {}".format(
+                job_type, ", ".join(_JOB_OPS)))
+    return await _async_send("start_job", {
+        "op": job_type,
+        "params": params or {},
+    })
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def wait_long_job(ctx: Context,
+                        job_id: int,
+                        timeout_s: float = 120.0,
+                        poll_s: float = 1.0) -> str:
+    """
+    Poll a long job started with start_long_job until it is done (or
+    timeout_s elapses) and return its status/result. Stage changes are
+    reported as MCP progress notifications when the client provided a
+    progress token.
+
+    Returns the job status dict: {job_id, op, done, cancelled, stage,
+    stage_index, stages_total, progress, result?, error?}. On completion
+    result holds the same shape the direct tool would have returned.
+    """
+    deadline = time.monotonic() + timeout_s
+    status: dict = {}
+    last_key = None
+    while time.monotonic() < deadline:
+        status = await asyncio.to_thread(_request, "job_status", {"job_id": job_id})
+        key = (status.get("stage"), status.get("stage_index"),
+               status.get("progress"), status.get("done"))
+        if key != last_key:
+            last_key = key
+            try:
+                await ctx.report_progress(
+                    float(status.get("progress") or 0.0), 1.0,
+                    message=str(status.get("stage") or ""))
+            except Exception:
+                pass
+        if status.get("done"):
+            break
+        await asyncio.sleep(max(0.2, min(float(poll_s), 2.0)))
+    else:
+        status = dict(status, note="Timed out waiting; the job keeps running "
+                                   "inside SD - poll get_job_status again.")
+    return json.dumps(status, indent=2)
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def get_job_status(ctx: Context, job_id: Optional[int] = None) -> str:
+    """
+    Return the current status of a long job without waiting or emitting
+    progress: {job_id, op, done, cancelled, stage, stage_index, stages_total,
+    progress, result?, error?}.
+
+    job_id: id from start_long_job. Omit for the latest job (one registry;
+    an error listing started job ids is raised when none is running).
+    """
+    return await _async_send("job_status", {"job_id": job_id})
+
+
+@mcp.tool(annotations=_UPDATE, structured_output=False)
+async def cancel_long_job(ctx: Context, job_id: int) -> str:
+    """
+    Request cancellation of a long job. It stops between stages (the single
+    graph.compute() stage cannot be interrupted mid-flight) and its status
+    reports done=True with cancelled=True.
+    """
+    return await _async_send("job_cancel", {"job_id": job_id})
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main():
-    global _sd_port
+def _positive_float(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("must be a number")
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
 
-    parser = argparse.ArgumentParser(description="Substance Designer MCP Bridge v2.0.0")
-    parser.add_argument("--port", type=int, default=9881,  # BUG-B03 fix: default is 9881
-                        help="TCP port to connect to the SD plugin (default: 9881)")
+
+def main():
+    global _sd_port, _auth_token, _allow_arbitrary_code, _allow_dev_tools
+    global TIMEOUT, HEAVY_TIMEOUT
+
+    parser = argparse.ArgumentParser(
+        description=f"Substance Designer MCP Bridge v{BRIDGE_VERSION}")
+    parser.add_argument("--port", type=int, default=_env_int("SD_MCP_PORT", 9881),
+                        help="TCP port to connect to the SD plugin (default: "
+                             "SD_MCP_PORT or 9881)")
+    parser.add_argument("--timeout", type=_positive_float, default=TIMEOUT,
+                        help="Socket timeout in seconds for ordinary commands "
+                             "(default: %(default)s; must exceed the plugin's "
+                             "SD_MCP_COMMAND_TIMEOUT)")
+    parser.add_argument("--heavy-timeout", type=_positive_float,
+                        default=HEAVY_TIMEOUT,
+                        help="Socket timeout for builds/computes/captures "
+                             "(default: %(default)s)")
+    parser.add_argument("--token",
+                        help="Shared secret sent with every command. Set "
+                             "SD_MCP_TOKEN in SD's environment to require it "
+                             "on the plugin side (localhost callers without "
+                             "the token are refused).")
+    parser.add_argument("--allow-arbitrary-code", action="store_true",
+                        help="Enable the execute_sd_code tool (runs arbitrary "
+                             "Python inside SD; the plugin has its own gate).")
+    parser.add_argument("--allow-dev-tools", action="store_true",
+                        help="Enable reload_plugin (re-executes plugin code "
+                             "from disk; the plugin has its own gate).")
     args = parser.parse_args()
     _sd_port = args.port
+    TIMEOUT = args.timeout
+    HEAVY_TIMEOUT = max(args.heavy_timeout, args.timeout)
+    _auth_token = args.token if args.token else os.environ.get("SD_MCP_TOKEN")
+    _allow_arbitrary_code = args.allow_arbitrary_code or os.environ.get(
+        "SD_MCP_ALLOW_EXECUTE_CODE", "").strip().lower() in ("1", "true", "yes", "on")
+    _allow_dev_tools = args.allow_dev_tools or os.environ.get(
+        "SD_MCP_ALLOW_DEV_TOOLS", "").strip().lower() in ("1", "true", "yes", "on")
 
-    logger.info(f"SD MCP Bridge v2.0.0 -> SD plugin on port {_sd_port}")
+    logger.info(f"SD MCP Bridge v{BRIDGE_VERSION} -> SD plugin on port {_sd_port}")
+    logger.info(f"Timeouts: default {TIMEOUT:g}s, heavy {HEAVY_TIMEOUT:g}s")
+    if _auth_token:
+        logger.info("Token auth: ENABLED (commands must match SD_MCP_TOKEN)")
+    else:
+        logger.info("Token auth: off (localhost only)")
+    if _allow_arbitrary_code:
+        logger.warning("execute_sd_code: ENABLED (--allow-arbitrary-code)")
+    else:
+        logger.info("execute_sd_code: disabled (use --allow-arbitrary-code to enable)")
+    if _allow_dev_tools:
+        logger.warning("reload_plugin: ENABLED (--allow-dev-tools)")
+    else:
+        logger.info("reload_plugin: disabled (use --allow-dev-tools to enable)")
     mcp.run()
 
 

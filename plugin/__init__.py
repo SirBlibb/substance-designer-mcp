@@ -1,13 +1,14 @@
 """
-Substance Designer MCP Plugin v3.4.0
+Substance Designer MCP Plugin v3.8.0
 =====================================
 ARCHITECTURE
 ============
 LLM -> stdio -> sd_mcp_bridge.py (FastMCP) -> TCP -> this plugin -> sd.api
-PORT: 9881 (all clients: Claude Code, Claude Desktop, Cursor)
+PORT: 9881 (override with SD_MCP_PORT; all clients: Claude Code, Claude Desktop, Cursor)
 PROTOCOL: Length-prefix framing [4-byte big-endian length][JSON payload]
-CONNECTION MODEL: Fresh TCP socket per command (no persistent connections)
-THREADING: ALL sd.api calls on Qt main thread via Signal/Slot queued dispatch
+CONNECTION MODEL: Fresh TCP socket per command, one worker thread per client
+THREADING: ALL sd.api calls on Qt main thread via Signal/Slot queued dispatch;
+           job_status/job_cancel read in-memory job records on worker threads
 
 ═══════════════════════════════════════════════════════════════════════════════
 NEW IN v3.0.0
@@ -53,6 +54,27 @@ VERSION HISTORY
   3.2.x - Reporting bug fix (library node definition field), recipes v5.0 (78 recipes, JP architecture)
   3.3.0 - list_documentation tool: embedded knowledge base for all SD nodes, ports, params, workflows
   3.4.0 - Port errors list valid port IDs (closest first); reload_plugin hot reload
+  3.5.0 - Library package loading from <SD>/resources/packages; recipe fixes
+  3.6.0 - capture_2d_view (texture + widget modes, contact sheets), get_map_stats
+  3.7.0 - set_parameters (batch edits, one node resolve each); inspect_outputs
+          (contact sheet + per-channel stats from a single graph compute)
+  3.8.0 - SECURITY: optional shared token (SD_MCP_TOKEN; commands must carry a
+          matching "token" field), constant-time token comparison, execute_code
+          opt-in gate (SD_MCP_ALLOW_EXECUTE_CODE=1 or an allow_execute_code
+          marker file), reload_plugin dev-tool gate. Batch builder: preflight
+          validation without creating a graph, cleanup_on_failure removes a
+          partially built graph. Long jobs: capture_2d_view, get_map_stats and
+          inspect_outputs run as staged, cancellable jobs (start_job /
+          job_status / job_cancel) with progress reporting.
+          capture_node_preview grabs the node tile (with SD's live thumbnail)
+          from the graph view without a graph.compute(); single node or a
+          labeled multi-node contact sheet, using a graph-view crop (or a
+          graph-owned preview widget when the SD version exposes one).
+          RELIABILITY: one worker per client so job polls and cancels are not
+          queued behind computes; command dispatch waits are bounded below the
+          bridge timeout, timed-out queued calls are cancelled, request ids
+          replay cached responses, SD_MCP_PORT selects the plugin port, and
+          non-finite floats are replaced with explicit flags.
 """
 
 import sd
@@ -68,6 +90,9 @@ import sys
 import io
 import time
 import queue
+import collections
+import hmac
+import math
 import importlib as _importlib
 from contextlib import redirect_stdout, redirect_stderr
 
@@ -88,14 +113,69 @@ from sd.api.sdvaluecolorrgba import SDValueColorRGBA
 from sd.api.sbs.sdsbscompgraph import SDSBSCompGraph
 
 # ── Configuration ────────────────────────────────────────────────────────────
-DEFAULT_PORTS     = [9881]
-PLUGIN_VERSION    = (3, 4, 0)
+def _env_int(name, default):
+    try:
+        return int(str(os.environ.get(name, "")).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_ports(raw):
+    """Parse SD_MCP_PORT ("9881" or "9881,9882") into a list of valid ports."""
+    ports = []
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            port = int(part)
+        except ValueError:
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    return ports
+
+
+DEFAULT_PORTS     = _parse_ports(os.environ.get("SD_MCP_PORT")) or [9881]
+PLUGIN_VERSION    = (3, 8, 0)
 HEADER_SIZE       = 4
-COMMAND_TIMEOUT   = 120
+COMMAND_TIMEOUT   = _env_int("SD_MCP_COMMAND_TIMEOUT", 120)
+COMMAND_TIMEOUT_MAX = _env_int("SD_MCP_COMMAND_TIMEOUT_MAX", 600)
+RESPONSE_GRACE    = 10.0  # send the reply before the bridge's socket timeout
+REQUEST_TIMEOUT   = 10    # clients send their request at once; never stall a worker on it
+SEND_TIMEOUT      = 120   # response sends reset the socket timeout (large contact sheets)
 CLIENT_TIMEOUT    = 130
-REQUEST_TIMEOUT   = 10    # connected clients send their request at once; never let one stall the serial accept loop
 ACCEPT_BACKLOG    = 5
+MAX_CLIENT_WORKERS = 16
 MAX_MSG_SIZE      = 100 * 1024 * 1024   # 100 MB
+IDEMPOTENCY_CACHE_SIZE = 128
+REQUEST_ID_MAX_LEN = 128
+
+
+def _command_budget(requested):
+    """Main-thread wait budget for one command.
+
+    The bridge sends its own socket timeout with each request; the plugin stops
+    waiting RESPONSE_GRACE seconds earlier so it can send a clean timeout error
+    before the bridge gives up. Never wait longer than COMMAND_TIMEOUT_MAX.
+    """
+    if requested is None:
+        return COMMAND_TIMEOUT
+    try:
+        requested = float(requested)
+    except (TypeError, ValueError):
+        return COMMAND_TIMEOUT
+    if requested <= 0:
+        return COMMAND_TIMEOUT
+    budget = min(requested - RESPONSE_GRACE, COMMAND_TIMEOUT_MAX)
+    if budget <= 0:
+        budget = max(0.1, requested * 0.8)
+    return budget
+
+
+# Commands that only read/write in-memory job records; they never touch sd.api,
+# so they stay responsive while the main thread is blocked by a compute.
+_THREADSAFE_COMMANDS = frozenset({"job_status", "job_cancel"})
 
 # System properties not valid as connection targets
 _SYSTEM_PARAMS = frozenset({
@@ -215,7 +295,7 @@ BLEND_MODES = {
 # ── Globals ──────────────────────────────────────────────────────────────────
 _server = None
 # Submodules reloaded by the reload_plugin command (pure Python, no SD state).
-_RELOADABLE_SUBMODULES = ("recipes", "sd_documentation", "port_suggest")
+_RELOADABLE_SUBMODULES = ("recipes", "sd_documentation", "port_suggest", "texture_stats")
 _library_cache = {}   # filter_text -> list of {identifier, url, package}
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -280,7 +360,10 @@ _pyside_path = _inject_sd_pyside_path()
 # '<SD install>/resources/packages'. They are not loaded into the package
 # manager until something instantiates them, so recipe pkg:/// URLs fail on a
 # fresh session (and their ?dependency= hashes drift between SD versions).
-# We load the packages the recipes need once, then resolve by identifier.
+# The SD API can only load packages as user packages, so we load the ones the
+# recipes need on demand, resolve by identifier, and after each command unload
+# the user-package copies again (_release_library_packages). Packages a graph
+# instances stay loaded as dependencies, the way SD's own library loads them.
 _LIBRARY_SOURCE_FILES = (
     "perlin_noise_1.sbs",
     "cells_1.sbs", "cells_2.sbs", "cells_4.sbs",
@@ -291,6 +374,7 @@ _LIBRARY_SOURCE_FILES = (
     "multi_directional_warp.sbs", "invert.sbs", "highpass.sbs",
     "histogram_scan.sbs", "edge_detect.sbs",
     "flood_fill_2.sbs", "tile_random.sbs",
+    "brick_generator.sbs", "tile_generator.sbs",
 )
 
 
@@ -376,6 +460,52 @@ for _qt_binding in ("PySide6.QtCore", "PySide2.QtCore"):
 
 
 # ── Qt main-thread invoker ───────────────────────────────────────────────────
+class _DispatchCall:
+    """One queued main-thread call, cancellable until it starts running.
+
+    A timed-out dispatcher cancels the call before it is popped from the Qt
+    queue, so a command that the caller has already given up on is not executed
+    later. Once the main thread starts the call it cannot be interrupted.
+    """
+
+    def __init__(self, fn, args, kwargs):
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.result = None
+        self.error = None
+        self.done = threading.Event()
+        self._lock = threading.Lock()
+        self._started = False
+        self._cancelled = False
+
+    def start(self):
+        with self._lock:
+            if self._cancelled:
+                return False
+            self._started = True
+            return True
+
+    def cancel(self):
+        """Cancel if still queued; False once the call has started."""
+        with self._lock:
+            if self._started:
+                return False
+            self._cancelled = True
+            return True
+
+    def run(self):
+        if not self.start():
+            self.done.set()
+            return
+        try:
+            self.result = self.fn(*self.args, **self.kwargs)
+        except Exception as e:
+            self.error = e
+        finally:
+            self.done.set()
+
+
 class _Invoker:
     _instance = None
 
@@ -400,18 +530,16 @@ class _Invoker:
                     self._queue = queue.Queue()
                     self.invoke_signal.connect(self._execute, qtcore.Qt.QueuedConnection)
 
-                def schedule(self, fn):
-                    self._queue.put(fn)
+                def schedule(self, call):
+                    self._queue.put(call)
                     self.invoke_signal.emit()
 
                 def _execute(self):
                     try:
-                        fn = self._queue.get_nowait()
-                        fn()
+                        call = self._queue.get_nowait()
                     except queue.Empty:
-                        pass
-                    except Exception as e:
-                        _log("Invoker._execute error: {}".format(e))
+                        return
+                    call.run()
 
             return Invoker()
         except Exception as e:
@@ -420,7 +548,7 @@ class _Invoker:
 
 
 class MainThreadDispatcher:
-    def dispatch(self, fn, *args, **kwargs):
+    def dispatch(self, fn, *args, timeout=None, **kwargs):
         if threading.current_thread() is threading.main_thread():
             try:
                 return fn(*args, **kwargs), None
@@ -434,31 +562,23 @@ class MainThreadDispatcher:
             return None, RuntimeError(
                 "Qt invoker unavailable — cannot dispatch to main thread." + hint)
 
-        result_holder = [None, None]
-        done = threading.Event()
+        budget = COMMAND_TIMEOUT if timeout is None else float(timeout)
+        call = _DispatchCall(fn, args, kwargs)
+        invoker.schedule(call)
 
-        def _call():
-            try:
-                result_holder[0] = fn(*args, **kwargs)
-            except Exception as e:
-                result_holder[1] = e
-            finally:
-                done.set()
-
-        invoker.schedule(_call)
-
-        if not done.wait(timeout=COMMAND_TIMEOUT):
+        if not call.done.wait(timeout=max(0.1, budget)):
+            call.cancel()
             return None, TimeoutError(
-                "Main thread dispatch timed out after {}s".format(COMMAND_TIMEOUT))
+                "Main thread dispatch timed out after {}s".format(budget))
 
-        return result_holder[0], result_holder[1]
+        return call.result, call.error
 
 
 _dispatcher = MainThreadDispatcher()
 
 
-def _run_on_main(fn, *args, **kwargs):
-    result, exc = _dispatcher.dispatch(fn, *args, **kwargs)
+def _run_on_main(fn, *args, timeout=None, **kwargs):
+    result, exc = _dispatcher.dispatch(fn, *args, timeout=timeout, **kwargs)
     if exc is not None:
         raise exc
     return result
@@ -494,7 +614,13 @@ def _recv_framed(sock, timeout=COMMAND_TIMEOUT):
     return payload
 
 
-def _send_framed(sock, data):
+def _send_framed(sock, data, timeout=SEND_TIMEOUT):
+    """Send one framed payload, resetting the socket timeout first.
+
+    _recv_framed leaves the socket at REQUEST_TIMEOUT; a large response (up to
+    MAX_MSG_SIZE) could exceed that while draining into the kernel buffer.
+    """
+    sock.settimeout(timeout)
     sock.sendall(struct.pack(">I", len(data)) + data)
 
 
@@ -507,6 +633,21 @@ class SDMCPServer:
         self.listeners = {}
         self._thread = None
         self._handler = CommandHandler()
+        # Optional shared secret: when SD_MCP_TOKEN is set in SD's environment,
+        # every command must carry a matching "token" field or it is refused
+        # before dispatch. The bridge sends it when started with --token.
+        self.token = os.environ.get("SD_MCP_TOKEN")
+        # Per-client workers keep job_status/job_cancel (and other clients)
+        # serviceable while one command waits on the SD main thread.
+        self._workers = set()
+        self._clients = set()
+        self._workers_lock = threading.Lock()
+        self._client_slots = threading.BoundedSemaphore(MAX_CLIENT_WORKERS)
+        # Request idempotency: a retried command with the same request_id gets
+        # the first response instead of running twice.
+        self._response_cache = collections.OrderedDict()
+        self._inflight = {}
+        self._idempotency_lock = threading.Lock()
 
     def start(self):
         self.running = True
@@ -540,6 +681,17 @@ class SDMCPServer:
             except Exception:
                 pass
         self.listeners.clear()
+        with self._workers_lock:
+            clients = list(self._clients)
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
         _log("Server stopped")
 
     def _serve_loop(self):
@@ -564,10 +716,50 @@ class SDMCPServer:
                     client, addr = listener.accept()
                 except (BlockingIOError, OSError):
                     continue
+
+                if not self._client_slots.acquire(blocking=False):
+                    try:
+                        _send_framed(client, json.dumps({
+                            "status": "error",
+                            "message": "Server busy: too many concurrent clients."
+                        }).encode("utf-8"), timeout=5)
+                    except Exception:
+                        pass
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                    continue
+
+                worker = threading.Thread(
+                    target=self._client_worker, args=(client, addr, port),
+                    daemon=True, name="SD-MCP-Client")
+                with self._workers_lock:
+                    self._workers.add(worker)
+                    self._clients.add(client)
                 try:
-                    self._handle_client(client, addr, port)
+                    worker.start()
                 except Exception as e:
-                    _log("Unexpected error: {}".format(e))
+                    _log("Failed to start client worker: {}".format(e))
+                    with self._workers_lock:
+                        self._workers.discard(worker)
+                        self._clients.discard(client)
+                    self._client_slots.release()
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+
+    def _client_worker(self, client, addr, port):
+        try:
+            self._handle_client(client, addr, port)
+        except Exception as e:
+            _log("Unexpected error in client worker: {}".format(e))
+        finally:
+            with self._workers_lock:
+                self._workers.discard(threading.current_thread())
+                self._clients.discard(client)
+            self._client_slots.release()
 
     def _handle_client(self, client, addr, port):
         try:
@@ -602,31 +794,144 @@ class SDMCPServer:
             except Exception:
                 pass
 
+    def _claim_request(self, request_id):
+        """Return (cached_response, wait_event, is_owner) for a request id."""
+        with self._idempotency_lock:
+            if request_id in self._response_cache:
+                return self._response_cache[request_id], None, False
+            event = self._inflight.get(request_id)
+            if event is not None:
+                return None, event, False
+            self._inflight[request_id] = threading.Event()
+            return None, None, True
+
+    def _finish_request(self, request_id, response):
+        with self._idempotency_lock:
+            self._response_cache[request_id] = response
+            while len(self._response_cache) > IDEMPOTENCY_CACHE_SIZE:
+                self._response_cache.popitem(last=False)
+            event = self._inflight.pop(request_id, None)
+        if event is not None:
+            event.set()
+
     def _execute_safe(self, command):
+        cmd_type = command.get("type")
+
+        # Authenticate before touching the idempotency cache, so unauthorized
+        # callers can never replay or poison another caller's request id.
+        if self.token:
+            provided = command.get("token")
+            try:
+                authorized = (isinstance(provided, str) and hmac.compare_digest(
+                    provided.encode("utf-8"), self.token.encode("utf-8")))
+            except Exception:
+                authorized = False
+            if not authorized:
+                _log("Rejected {}: token missing or incorrect.".format(cmd_type))
+                return {"status": "error",
+                        "message": "Unauthorized: token missing or incorrect. "
+                                   "The bridge must be started with --token "
+                                   "matching the SD_MCP_TOKEN set for SD."}
+
+        request_id = command.get("request_id")
+        rid = None
+        if request_id not in (None, ""):
+            rid = str(request_id)
+            if len(rid) > REQUEST_ID_MAX_LEN:
+                rid = None
+
+        owner = False
+        if rid:
+            cached, event, owner = self._claim_request(rid)
+            if cached is not None:
+                _log("Idempotent replay: {} ({})".format(cmd_type, rid))
+                return cached
+            if event is not None:
+                budget = _command_budget(command.get("timeout"))
+                if not event.wait(timeout=max(0.1, budget)):
+                    return {"status": "error",
+                            "message": "Duplicate request '{}' is still in progress; "
+                                       "retry with a new request_id.".format(rid)}
+                with self._idempotency_lock:
+                    cached = self._response_cache.get(rid)
+                if cached is not None:
+                    return cached
+                return {"status": "error",
+                        "message": "Duplicate request '{}' failed before producing "
+                                   "a response.".format(rid)}
+
+        response = None
         try:
-            cmd_type = command.get("type")
-            params   = command.get("params", {})
-            _log("Executing: {}".format(cmd_type))
-            result = _run_on_main(self._handler.dispatch, cmd_type, params)
-            _log("Done: {}".format(cmd_type))
-            return {"status": "success", "result": result if result is not None else {}}
+            params = command.get("params", {})
+            budget = _command_budget(command.get("timeout"))
+            label = "{} ({})".format(cmd_type, rid) if rid else cmd_type
+            _log("Executing: {}".format(label))
+            if cmd_type in _THREADSAFE_COMMANDS:
+                result = self._handler.dispatch(cmd_type, params)
+            else:
+                result = _run_on_main(self._handler.dispatch, cmd_type, params,
+                                      timeout=budget)
+            _log("Done: {}".format(label))
+
+            flags = []
+            result = _mark_nonfinite(result, flags)
+            response = {"status": "success",
+                        "result": result if result is not None else {}}
+            if flags:
+                response["non_finite_values"] = flags
+            return response
         except Exception as e:
-            _log("Error in {}: {}".format(command.get("type", "?"), e))
+            _log("Error in {}: {}".format(cmd_type or "?", e))
             try:
                 traceback.print_exc()
             except Exception:
                 pass
-            return {"status": "error", "message": str(e)}
+            response = {"status": "error", "message": str(e)}
+            return response
+        finally:
+            if owner:
+                self._finish_request(
+                    rid, response if response is not None else
+                    {"status": "error", "message": "Request did not complete."})
+
+
+def _mark_nonfinite(obj, flags, path="$"):
+    """Replace non-finite floats with None and record their paths.
+
+    JSON has no NaN/Infinity. Silently substituting values (or emitting
+    non-standard literals) hides data problems, so the response carries an
+    explicit `non_finite_values` list alongside the sanitized result.
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            flags.append({"path": path, "value": "nan"})
+            return None
+        if math.isinf(obj):
+            flags.append({"path": path, "value": "inf" if obj > 0 else "-inf"})
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {key: _mark_nonfinite(value, flags, "{}.{}".format(path, key))
+                for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_mark_nonfinite(value, flags, "{}[{}]".format(path, idx))
+                for idx, value in enumerate(obj)]
+    return obj
 
 
 def _json_safe(obj):
+    """json.dumps fallback for values JSON cannot encode.
+
+    Non-finite floats are normally handled by _mark_nonfinite; if one reaches
+    this fallback it becomes an explicit marker rather than a silent value.
+    """
     if isinstance(obj, float):
         if obj != obj:
-            return None
+            return {"__non_finite__": "nan"}
         if obj == float('inf'):
-            return 1e308
+            return {"__non_finite__": "inf"}
         if obj == float('-inf'):
-            return -1e308
+            return {"__non_finite__": "-inf"}
     return str(obj)
 
 
@@ -742,6 +1047,7 @@ class CommandHandler:
             "disconnect_nodes":       self.disconnect_nodes,
             # ── Parameters ──
             "set_parameter":          self.set_parameter,
+            "set_parameters":         self.set_parameters,
             "set_graph_output_size":  self.set_graph_output_size,
             # ── Batch builders ──
             "create_batch_graph":     self.create_batch_graph,
@@ -756,6 +1062,13 @@ class CommandHandler:
             "arrange_nodes":          self.arrange_nodes,
             "execute_code":           self.execute_code,
             "capture_3d_view":        self.capture_3d_view,
+            "capture_2d_view":        self.capture_2d_view,
+            "capture_node_preview":   self.capture_node_preview,
+            "get_map_stats":          self.get_map_stats,
+            "inspect_outputs":        self.inspect_outputs,
+            "start_job":              self.start_job,
+            "job_status":             self.job_status,
+            "job_cancel":             self.job_cancel,
             "send_to_3d_view":        self.send_to_3d_view,
             "send_to_3d_view_status": self.send_to_3d_view_status,
             # ── Documentation ──
@@ -765,14 +1078,27 @@ class CommandHandler:
         }
         # Library node URL cache (populated lazily, session-lifetime)
         self._lib_url_cache = {}  # lower-case identifier -> url string
-        self._library_loaded = False
+        # Long-job registry: job_id -> (public job dict, stage generator)
+        self._jobs = {}
+        self._job_seq = 0
+        # Guards the registry and the cancelled flag; job_status/job_cancel run
+        # on client worker threads while stages run on the main thread.
+        self._jobs_lock = threading.Lock()
 
     def dispatch(self, cmd_type, params):
         handler = self.HANDLERS.get(cmd_type)
         if not handler:
             raise ValueError("Unknown command: '{}'. Available: {}".format(
                 cmd_type, sorted(self.HANDLERS.keys())))
-        return handler(**params)
+        # Job control reads/writes in-memory records only. Running it directly
+        # on the worker thread keeps it responsive while sd.api blocks the main
+        # thread, and avoids the library-package release (an sd.api call).
+        if cmd_type in _THREADSAFE_COMMANDS:
+            return handler(**params)
+        try:
+            return handler(**params)
+        finally:
+            self._release_library_packages()
 
     # ═══════════════════════════════════════════════════════════════════════
     # ── SD API helpers ──────────────────────────────────────────────────
@@ -911,11 +1237,21 @@ class CommandHandler:
             "float2, float3, float4, color, int2, int3, int4".format(value_type))
 
     def _resolve_lib_url(self, keyword):
-        """Find a library node URL by keyword (case-insensitive). Cached."""
-        key = keyword.lower()
+        """Find a library node URL by identifier (case-insensitive). Cached.
+
+        Exact identifier matches always win over substring matches. If several
+        resources match equally (e.g. the same short name in two loaded
+        packages, or a broad substring), raise instead of silently returning
+        whichever package happens to be enumerated first.
+        """
+        key = str(keyword).strip().lower()
+        if not key:
+            return None
         if key in self._lib_url_cache:
             return self._lib_url_cache[key]
+
         self._ensure_library_loaded()
+        exact, partial = [], []
         for pkg in list(self._pkg_mgr().getPackages()):
             try:
                 fp = pkg.getFilePath()
@@ -931,17 +1267,21 @@ class CommandHandler:
                                 if "SDSBSCompGraph" not in res.getClassName():
                                     continue
                                 rid = res.getIdentifier()
-                                if key in rid.lower():
-                                    url = None
-                                    try:
-                                        url = res.getUrl()
-                                    except Exception:
-                                        pass
-                                    if url:
-                                        self._lib_url_cache[key] = url
-                                        # also cache by exact identifier
-                                        self._lib_url_cache[rid.lower()] = url
-                                        return url
+                                rkey = rid.lower()
+                                if key != rkey and key not in rkey:
+                                    continue
+                                url = None
+                                try:
+                                    url = res.getUrl()
+                                except Exception:
+                                    pass
+                                if not url:
+                                    continue
+                                entry = (rid, url, fp)
+                                if rkey == key:
+                                    exact.append(entry)
+                                else:
+                                    partial.append(entry)
                             except Exception:
                                 pass
                         break
@@ -949,28 +1289,96 @@ class CommandHandler:
                         continue
             except Exception:
                 pass
-        return None
 
-    def _ensure_library_loaded(self):
-        """Load SD library .sbs packages once so pkg:/// URLs can resolve."""
-        if getattr(self, "_library_loaded", False):
-            return
-        self._library_loaded = True
+        matches = exact or partial
+        if not matches:
+            return None
+        # The same resource can be reported more than once; dedupe by URL.
+        unique = collections.OrderedDict()
+        for rid, url, fp in matches:
+            unique.setdefault(url, (rid, url, fp))
+        if len(unique) > 1:
+            described = ", ".join(
+                "'{}' ({})".format(rid, os.path.basename(fp or "?"))
+                for rid, _url, fp in unique.values())
+            raise ValueError(
+                "Library identifier '{}' is ambiguous; {} matches: {}. "
+                "Use a more specific library_keyword or pass a pkg:/// "
+                "resource_url instead.".format(keyword, len(unique), described))
+
+        rid, url, _fp = next(iter(unique.values()))
+        self._lib_url_cache[key] = url
+        self._lib_url_cache[rid.lower()] = url
+        return url
+
+    def _load_library_file(self, lib_dir, fname, loaded_paths):
+        """Load one SD library .sbs unless it is already loaded. True if loaded now."""
+        path = os.path.join(lib_dir, fname)
+        if not os.path.isfile(path):
+            return False
+        if os.path.normcase(os.path.normpath(path)) in loaded_paths:
+            return False
+        try:
+            self._pkg_mgr().loadUserPackage(path)
+            loaded_paths.add(os.path.normcase(os.path.normpath(path)))
+            return True
+        except Exception as e:
+            _log("Library load failed for {}: {}".format(fname, e))
+            return False
+
+    def _loaded_package_paths(self):
+        paths = set()
+        for pkg in list(self._pkg_mgr().getPackages()):
+            try:
+                fp = pkg.getFilePath()
+                if fp:
+                    paths.add(os.path.normcase(os.path.normpath(fp)))
+            except Exception:
+                pass
+        return paths
+
+    def _ensure_library_loaded(self, identifier=None):
+        """Load SD library .sbs packages so pkg:/// URLs can resolve.
+
+        With an identifier, first try just '<identifier>.sbs' (e.g.
+        brick_generator); returns True if that file exists. Otherwise load
+        every package in _LIBRARY_SOURCE_FILES that is not loaded yet.
+        The user-package copies are released again after the command."""
         lib_dir = _find_sd_library_dir()
         if not lib_dir:
             _log("Library dir not found - library nodes unavailable")
-            return
+            return False
+        loaded_paths = self._loaded_package_paths()
+        if identifier:
+            fname = os.path.basename(identifier) + ".sbs"
+            if os.path.isfile(os.path.join(lib_dir, fname)):
+                self._load_library_file(lib_dir, fname, loaded_paths)
+                return True
+            return False
         loaded = 0
         for fname in _LIBRARY_SOURCE_FILES:
-            path = os.path.join(lib_dir, fname)
-            if not os.path.isfile(path):
-                continue
-            try:
-                self._pkg_mgr().loadUserPackage(path)
+            if self._load_library_file(lib_dir, fname, loaded_paths):
                 loaded += 1
-            except Exception as e:
-                _log("Library load failed for {}: {}".format(fname, e))
-        _log("Loaded {} library packages from {}".format(loaded, lib_dir))
+        if loaded:
+            _log("Loaded {} library packages from {}".format(loaded, lib_dir))
+        return False
+
+    def _release_library_packages(self):
+        """Unload SD library packages that are open as user packages.
+
+        Those a graph instances stay loaded as its dependencies (not user
+        packages); unused ones are dropped and reloaded on demand. Modified
+        packages are left alone."""
+        try:
+            mgr = self._pkg_mgr()
+            for pkg in list(mgr.getUserPackages()):
+                try:
+                    if _is_builtin_package(pkg.getFilePath()) and not pkg.isModified():
+                        mgr.unloadUserPackage(pkg)
+                except Exception as e:
+                    _log("Library release failed: {}".format(e))
+        except Exception as e:
+            _log("Library release failed: {}".format(e))
 
     def _find_resource_by_url(self, url):
         """Return the resource matching an exact pkg:/// URL, or None."""
@@ -1010,11 +1418,13 @@ class CommandHandler:
         res = self._find_resource_by_url(url)
         if res is not None:
             return res, url
-        self._ensure_library_loaded()
+        ident = url.split("pkg:///")[-1].split("?")[0].strip("/")
+        # 'pkg:///brick_generator' -> load just brick_generator.sbs first
+        if not (ident and self._ensure_library_loaded(ident)):
+            self._ensure_library_loaded()
         res = self._find_resource_by_url(url)
         if res is not None:
             return res, url
-        ident = url.split("pkg:///")[-1].split("?")[0].strip("/")
         if ident:
             res = self._find_lib_resource(ident)
             if res is not None:
@@ -1066,29 +1476,8 @@ class CommandHandler:
             return {}
         results = {}
 
-        # Build property type maps: id -> SDType id string
-        input_type_map  = {}   # param_id -> sd_type_id
-        annot_type_map  = {}
-        try:
-            for p in list(node.getProperties(SDPropertyCategory.Input)):
-                pid = p.getId()
-                try:
-                    t = p.getType()
-                    input_type_map[pid] = t.getId() if t else ""
-                except Exception:
-                    input_type_map[pid] = ""
-        except Exception:
-            pass
-        try:
-            for p in list(node.getProperties(SDPropertyCategory.Annotation)):
-                pid = p.getId()
-                try:
-                    t = p.getType()
-                    annot_type_map[pid] = t.getId() if t else ""
-                except Exception:
-                    annot_type_map[pid] = ""
-        except Exception:
-            pass
+        # Property type maps: id -> SDType id string
+        input_type_map, annot_type_map = self._node_property_ids(node)
 
         for param_id, param_spec in params.items():
             # Skip system params — they cannot be set as node inputs safely
@@ -1177,6 +1566,17 @@ class CommandHandler:
         in_list  = self._port_ids(to_node, SDPropertyCategory.Input)
         out_ids  = set(out_list)
         in_ids   = set(in_list)
+
+        if not out_ids:
+            raise RuntimeError(
+                "Cannot validate output port '{}' on node {}: SD reported no "
+                "output ports. Refusing to connect unvalidated.".format(
+                    from_out, self._node_label(from_node)))
+        if not in_ids:
+            raise RuntimeError(
+                "Cannot validate input port '{}' on node {}: SD reported no "
+                "input ports. Refusing to connect unvalidated.".format(
+                    to_in, self._node_label(to_node)))
 
         if out_ids and from_out not in out_ids:
             # Library instance nodes expose version-specific output port names
@@ -1592,6 +1992,1215 @@ class CommandHandler:
             "screen grab failed). Make sure the 3D view is open and SD is visible.")
 
     # ═══════════════════════════════════════════════════════════════════════
+    # ── 2D VIEW CAPTURE ─────────────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _map_label(self, node):
+        from sd.api.sdproperty import SDPropertyCategory
+        try:
+            value = node.getPropertyValueFromId(
+                "label", SDPropertyCategory.Annotation)
+            return (value.get() or "") if value else ""
+        except Exception:
+            return ""
+
+    def _find_map_node(self, graph, node_id=None, output_usage=None):
+        """Resolve either a node id or a graph output label to an SD node."""
+        if bool(node_id) == bool(output_usage):
+            raise ValueError("Pass exactly one of node_id or output_usage.")
+        if node_id:
+            node = self._find_node(graph, node_id)
+            return node, self._map_label(node)
+
+        def _norm(value):
+            return "".join(c for c in (value or "").lower() if c.isalnum())
+
+        aliases = {"ao": "ambientocclusion"}
+        want = aliases.get(_norm(output_usage), _norm(output_usage))
+
+        try:
+            array = graph.getOutputNodes()
+            nodes = [array.getItem(i) for i in range(array.getSize())]
+        except Exception:
+            nodes = [n for n in graph.getNodes()
+                     if self._get_node_def_id(n) == "sbs::compositing::output"]
+        matches = [(self._map_label(n), n) for n in nodes
+                   if aliases.get(_norm(self._map_label(n)),
+                                  _norm(self._map_label(n))) == want]
+        if not matches:
+            raise ValueError(
+                "No output node matches usage '{}'. Available outputs: {}."
+                .format(output_usage, [self._map_label(n) for n in nodes]))
+        return matches[0][1], matches[0][0]
+
+    def _map_texture_outputs(self, node):
+        from sd.api.sdproperty import SDPropertyCategory
+        props = []
+        try:
+            props = list(node.getProperties(SDPropertyCategory.Output))
+        except Exception:
+            pass
+        if not props:
+            try:
+                props = list(node.getDefinition().getProperties(
+                    SDPropertyCategory.Output))
+            except Exception:
+                pass
+        outputs = []
+        for prop in props:
+            try:
+                prop_type = prop.getType()
+                if (prop_type is None
+                        or "Texture" not in (prop_type.getClassName() or "")):
+                    continue
+                value = node.getPropertyValue(prop)
+                texture = value.get() if value is not None else None
+                if texture is not None:
+                    outputs.append((prop.getId(), texture))
+            except Exception:
+                continue
+        return outputs
+
+    def _select_map_texture(self, node, port_id=None):
+        outputs = self._map_texture_outputs(node)
+        if not outputs:
+            raise ValueError(
+                "Node '{}' has no computed texture output. Ensure it is "
+                "connected and evaluated.".format(node.getIdentifier()))
+        if port_id:
+            for pid, texture in outputs:
+                if pid == port_id:
+                    return pid, texture
+            raise ValueError(
+                "Port '{}' has no computed texture on node '{}'. Available "
+                "ports: {}.".format(port_id, node.getIdentifier(),
+                                    [pid for pid, _ in outputs]))
+        if len(outputs) == 1:
+            return outputs[0]
+        for preferred in ("output", "unique_filter_output"):
+            for pid, texture in outputs:
+                if pid == preferred:
+                    return pid, texture
+        raise ValueError(
+            "Node '{}' has several texture outputs {}; pass port_id."
+            .format(node.getIdentifier(), [pid for pid, _ in outputs]))
+
+    def _map_texture_to_qimage(self, texture):
+        from PySide6.QtGui import QImage
+        try:
+            import shiboken6 as shiboken
+        except Exception:
+            try:
+                import shiboken2 as shiboken
+            except Exception:
+                shiboken = None
+        if shiboken is None:
+            raise RuntimeError("shiboken not available; cannot convert SDTexture.")
+        image = QImage()
+        self._ui_mgr().convertSDTextureToQImage(
+            texture, shiboken.getCppPointer(image)[0])
+        if image.isNull():
+            raise RuntimeError("SDTexture -> QImage conversion produced an empty image.")
+        return image
+
+    def _default_output_path(self, prefix):
+        """PNG path under %TEMP%/sd_mcp_preview (created on save)."""
+        out_dir = os.path.join(os.environ.get("TEMP", "."), "sd_mcp_preview")
+        return os.path.join(
+            out_dir, "{}_{}.png".format(prefix, time.strftime("%Y%m%d_%H%M%S")))
+
+    @staticmethod
+    def _ensure_output_dir(path):
+        path = os.path.abspath(path)
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _downscale_preview(image, max_size):
+        """Scale a preview QImage so its longest side is <= max_size (0 = native)."""
+        if max_size and int(max_size) > 0 and \
+                max(image.width(), image.height()) > int(max_size):
+            from PySide6.QtCore import Qt
+            return image.scaled(int(max_size), int(max_size),
+                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        return image
+
+    def _render_contact_sheet(self, tiles, output_path=None,
+                              prefix="2dview_contact_sheet"):
+        """Draw labeled preview tiles into a two-column grid image.
+
+        tiles: [{'image': QImage, 'usage', 'label', 'node', 'port_id',
+                 'source_width', 'source_height'}, ...]
+        Returns {path, width, height, columns, rows, items}.
+        """
+        from PySide6.QtGui import QColor, QFont, QImage, QPainter
+        columns = min(2, len(tiles))
+        rows = (len(tiles) + columns - 1) // columns
+        cell_width = max(tile["image"].width() for tile in tiles)
+        cell_height = max(tile["image"].height() for tile in tiles)
+        label_height = 30
+        sheet = QImage(columns * cell_width,
+                       rows * (cell_height + label_height),
+                       QImage.Format_ARGB32)
+        sheet.fill(QColor(34, 36, 40))
+        painter = QPainter(sheet)
+        painter.setPen(QColor(245, 245, 245))
+        painter.setFont(QFont("Arial", 11, QFont.Bold))
+        item_info = []
+        for index, tile in enumerate(tiles):
+            col, row = index % columns, index // columns
+            x, y = col * cell_width, row * (cell_height + label_height)
+            painter.drawText(x + 8, y + 21, tile["label"])
+            image = tile["image"]
+            ix = x + (cell_width - image.width()) // 2
+            iy = y + label_height + (cell_height - image.height()) // 2
+            painter.drawImage(ix, iy, image)
+            item_info.append({k: tile[k] for k in (
+                "usage", "label", "node", "port_id",
+                "source_width", "source_height")})
+        painter.end()
+        if not output_path:
+            output_path = self._default_output_path(prefix)
+        output_path = self._ensure_output_dir(output_path)
+        if not sheet.save(output_path):
+            raise RuntimeError(
+                "Failed to save image to '{}'.".format(output_path))
+        return {"path": output_path, "width": sheet.width(),
+                "height": sheet.height(), "columns": columns,
+                "rows": rows, "items": item_info}
+
+    def _texture_stats(self, texture, histogram_bins=16):
+        """Per-channel min/max/mean + histogram from one computed SDTexture.
+
+        Copies the raw pixel buffer and delegates to texture_stats (pure
+        Python, unit-tested outside SD). Shared by get_map_stats and
+        inspect_outputs; see that module for the exact semantics.
+        """
+        import ctypes
+        from . import texture_stats
+
+        bins = int(histogram_bins)
+        if bins < 1 or bins > 512:
+            raise ValueError("histogram_bins must be between 1 and 512.")
+
+        pixel_format = texture.getPixelFormat()
+        format_name = pixel_format.name if pixel_format is not None else "Unknown"
+        spec = texture_stats.FORMATS.get(format_name)
+        if spec is None:
+            raise ValueError(
+                "Unsupported SDTexture pixel format '{}'."
+                .format(format_name))
+        expected_bytes = spec[1] * len(spec[4])
+        dimensions = texture.getSize()
+        if dimensions is None:
+            raise RuntimeError("SDTexture did not report its dimensions.")
+        width, height = int(dimensions.x), int(dimensions.y)
+        bytes_per_pixel = int(texture.getBytesPerPixel())
+        if (width <= 0 or height <= 0
+                or bytes_per_pixel != expected_bytes):
+            raise RuntimeError(
+                "Unexpected SDTexture layout: {}x{}, {} bytes per pixel "
+                "for {}.".format(width, height, bytes_per_pixel, format_name))
+        row_size = width * bytes_per_pixel
+        row_pitch = int(texture.getRowPitch())
+        address = int(texture.getPixelBufferAddress() or 0)
+        if not address or not row_pitch:
+            raise RuntimeError("SDTexture pixel buffer is unavailable.")
+        if abs(row_pitch) < row_size:
+            raise RuntimeError(
+                "SDTexture row pitch {} is smaller than its {}-byte row."
+                .format(row_pitch, row_size))
+
+        first_row = address + min(0, (height - 1) * row_pitch)
+        span = (height - 1) * abs(row_pitch) + row_size
+        buffer = ctypes.string_at(first_row, span)
+        return texture_stats.stats_from_buffer(
+            buffer, width, height, row_pitch, format_name, bins)
+
+    def capture_2d_view(self, graph_identifier=None, node_id=None,
+                        output_usage=None, output_usages=None,
+                        port_id=None, max_size=1024,
+                        output_path=None, wait_ms=600):
+        """Capture one map, a labeled output contact sheet, or the 2D view widget.
+
+        Runs the staged generator to completion synchronously; start_job
+        ("capture_2d_view") runs the same stages step-by-step so progress can
+        be polled and the job cancelled between stages.
+
+        Capture modes:
+        - Texture mode (node_id or output_usage given): calls graph.compute()
+          and saves the target node's output texture through the SD API - exact
+          pixels at native resolution, no UI interaction (works while SD is
+          occluded or on another tab).
+          - node_id: any node of the graph (undefined port picks the only
+            texture output).
+          - output_usage: selects the OUTPUT node whose label matches, e.g.
+            'height', 'normal', 'Base Color', 'ao', 'ambientOcclusion'.
+          - output_usages: renders those output labels in one contact sheet.
+            This cannot be combined with node_id or output_usage.
+          - port_id: output port to use when the node has several texture
+            outputs (e.g. 'output_1', 'unique_filter_output').
+          - max_size: downscale so the longest side <= max_size (0 = native).
+        - Widget mode (neither node_id nor output_usage): grabs the visible
+          2D view widget - exactly what SD shows (selection preview, tiling,
+          zoom, checkerboard). If graph_identifier is given, that graph's tab
+          is opened first.
+
+        Returns {path, width, height, method, ...}.
+        """
+        job = {"stage": "resolve_graph", "progress": 0.0,
+               "stages_total": 0, "result": None}
+        self._drive_sync(self._gen_capture_2d_view(job, {
+            "graph_identifier": graph_identifier,
+            "node_id": node_id,
+            "output_usage": output_usage,
+            "output_usages": output_usages,
+            "port_id": port_id,
+            "max_size": max_size,
+            "output_path": output_path,
+            "wait_ms": wait_ms,
+        }), job)
+        return job["result"]
+
+    def _gen_capture_2d_view(self, job, params):
+        graph_identifier = params.get("graph_identifier")
+        node_id          = params.get("node_id")
+        output_usage     = params.get("output_usage")
+        output_usages    = params.get("output_usages")
+        port_id          = params.get("port_id")
+        max_size         = params.get("max_size", 1024)
+        output_path      = params.get("output_path")
+        wait_ms          = params.get("wait_ms", 600)
+
+        graph = self._resolve_graph(graph_identifier)
+        gid = graph.getIdentifier()
+
+        # ── texture mode: render one map or a contact sheet ──
+        if output_usages is not None:
+            if node_id or output_usage:
+                raise ValueError(
+                    "output_usages cannot be combined with node_id or output_usage.")
+            usages = [str(usage) for usage in output_usages if str(usage).strip()]
+            if not usages or len(usages) > 16:
+                raise ValueError("Pass between 1 and 16 output_usages.")
+            job["stages_total"] = 2 + len(usages)
+            job["stage"] = "compute"
+            yield
+            try:
+                graph.compute()
+            except Exception as e:
+                raise RuntimeError(
+                    "graph.compute() failed for '{}': {}".format(gid, e))
+
+            tiles = []
+            for index, usage in enumerate(usages):
+                job["stage"] = "read_output"
+                job["progress"] = round(0.1 + 0.7 * index / len(usages), 3)
+                yield
+                node, label = self._find_map_node(graph, output_usage=usage)
+                pid, texture = self._select_map_texture(node)
+                image = self._map_texture_to_qimage(texture)
+                src_w, src_h = image.width(), image.height()
+                tiles.append({"usage": usage, "label": label or usage,
+                              "node": node.getIdentifier(), "port_id": pid,
+                              "source_width": src_w, "source_height": src_h,
+                              "image": self._downscale_preview(image, max_size)})
+
+            job["stage"] = "render_sheet"
+            job["progress"] = 0.9
+            yield
+            sheet = self._render_contact_sheet(
+                tiles, output_path, prefix="2dview_contact_sheet")
+            job["stage"] = "done"
+            job["progress"] = 1.0
+            job["result"] = {"path": sheet["path"], "width": sheet["width"],
+                             "height": sheet["height"], "method": "contact_sheet",
+                             "graph": gid, "columns": sheet["columns"],
+                             "rows": sheet["rows"], "items": sheet["items"]}
+            return
+
+        if node_id or output_usage:
+            node, label = self._find_map_node(
+                graph, node_id=node_id, output_usage=output_usage)
+            job["stages_total"] = 4   # resolve, compute, convert, save
+            job["stage"] = "compute"
+            yield
+            try:
+                graph.compute()
+            except Exception as e:
+                raise RuntimeError(
+                    "graph.compute() failed for '{}': {}".format(gid, e))
+            pid, tex = self._select_map_texture(node, port_id)
+
+            job["stage"] = "convert"
+            job["progress"] = 0.8
+            yield
+            img = self._map_texture_to_qimage(tex)
+            src_w, src_h = img.width(), img.height()
+            img = self._downscale_preview(img, max_size)
+
+            if not output_path:
+                safe = re.sub(r'[^A-Za-z0-9]+', '_', label).strip('_').lower()
+                output_path = self._default_output_path(
+                    "2dview_" + safe if safe else "2dview")
+            output_path = self._ensure_output_dir(output_path)
+            job["stage"] = "save"
+            job["progress"] = 0.95
+            yield
+            if not img.save(output_path):
+                raise RuntimeError(
+                    "Failed to save image to '{}'.".format(output_path))
+            job["stage"] = "done"
+            job["progress"] = 1.0
+            job["result"] = {
+                "path":          output_path,
+                "width":         img.width(),
+                "height":        img.height(),
+                "method":        "texture",
+                "source_width":  src_w,
+                "source_height": src_h,
+                "graph":         gid,
+                "node":          node.getIdentifier(),
+                "port_id":       pid,
+                "label":         label,
+            }
+            return
+
+        # ── widget mode: grab what the 2D view currently shows ──
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QTimer, QEventLoop
+
+        app = QApplication.instance()
+        if app is None:
+            raise RuntimeError("Qt application not available.")
+        job["stages_total"] = 4   # resolve, open/wait, grab, save
+
+        def _pump(ms):
+            loop = QEventLoop()
+            QTimer.singleShot(int(ms), loop.quit)
+            loop.exec()
+
+        if graph_identifier:
+            job["stage"] = "open_editor"
+            job["progress"] = 0.1
+            yield
+            try:
+                self._ui_mgr().openResourceInEditor(graph)
+            except Exception:
+                pass
+            _pump(max(200, int(wait_ms)))
+
+        job["stage"] = "grab"
+        job["progress"] = 0.5
+        yield
+        widget = None
+        for w in app.allWidgets():
+            try:
+                if (w.metaObject().className()
+                        == "Pfx::Editor::Components::View2D::GraphicsView"
+                        and w.isVisible() and w.width() > 100):
+                    widget = w
+                    break
+            except Exception:
+                pass
+        if widget is None:
+            raise RuntimeError(
+                "2D view widget not found. Open the 2D view in SD (F2) first.")
+
+        try:
+            pix = widget.grab()
+        except Exception as e:
+            raise RuntimeError("2D view grab failed: {}".format(e))
+        if pix is None or pix.isNull():
+            raise RuntimeError("2D view grab produced an empty image.")
+
+        if not output_path:
+            output_path = self._default_output_path("2dview")
+        output_path = self._ensure_output_dir(output_path)
+        job["stage"] = "save"
+        job["progress"] = 0.95
+        yield
+        if not pix.save(output_path):
+            raise RuntimeError(
+                "Failed to save image to '{}'.".format(output_path))
+        job["stage"] = "done"
+        job["progress"] = 1.0
+        job["result"] = {
+            "path":   output_path,
+            "width":  pix.width(),
+            "height": pix.height(),
+            "method": "widget_grab",
+            "graph":  gid,
+        }
+
+    def capture_node_preview(self, graph_identifier=None, node_id=None,
+                             node_ids=None, max_size=512, output_path=None,
+                             wait_ms=250):
+        """Capture node preview thumbnails from the graph editor.
+
+        Grabs each node's tile (which contains SD's live thumbnail) from the
+        visible graph view, so no graph.compute() is needed: fast, and works on
+        nodes that are not connected to a graph output. SD 15 renders node
+        previews in the scene rather than as per-node widgets; a graph-owned
+        preview widget is used when the SD version exposes one. Each node is
+        fitted into view for a consistent crop, then the original zoom and
+        scroll position are restored.
+
+        - node_id: one node; node_ids: several nodes (labeled contact sheet).
+        - max_size: downscale so the longest side <= max_size (0 = native).
+        - wait_ms: settle time after opening/focusing the node.
+        Returns {path, width, height, method, graph, node, label, ...} for one
+        node, or a contact-sheet result with items + skipped for several.
+
+        Runs the staged generator to completion synchronously; start_job
+        ("capture_node_preview") runs the same stages step-by-step.
+        """
+        job = {"stage": "resolve_graph", "progress": 0.0,
+               "stages_total": 0, "result": None}
+        self._drive_sync(self._gen_capture_node_preview(job, {
+            "graph_identifier": graph_identifier,
+            "node_id": node_id,
+            "node_ids": node_ids,
+            "max_size": max_size,
+            "output_path": output_path,
+            "wait_ms": wait_ms,
+        }), job)
+        return job["result"]
+
+    def _capture_node_preview_nodes(self, graph, node_id=None, node_ids=None):
+        """Resolve node_id/node_ids to a deduped [(node, label), ...] list."""
+        raw = []
+        if node_id:
+            raw.append(str(node_id))
+        if node_ids:
+            if isinstance(node_ids, str):
+                node_ids = [node_ids]
+            raw.extend(str(value) for value in node_ids
+                       if str(value).strip())
+        if not raw:
+            raise ValueError("Pass node_id or node_ids (at least one node).")
+        unique = []
+        for value in raw:
+            if value not in unique:
+                unique.append(value)
+        if len(unique) > 32:
+            raise ValueError(
+                "At most 32 node previews per call (got {}).".format(
+                    len(unique)))
+        targets = []
+        for value in unique:
+            node = self._find_node(graph, value)
+            targets.append((node, self._map_label(node)))
+        return targets
+
+    def _pump_qt_events(self, ms):
+        from PySide6.QtCore import QEventLoop, QTimer
+        loop = QEventLoop()
+        QTimer.singleShot(max(0, int(ms)), loop.quit)
+        loop.exec()
+
+    def _visible_graph_view(self):
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is None:
+            return None
+        for widget in app.allWidgets():
+            try:
+                if (widget.metaObject().className()
+                        == "Pfx::Editor::Components::Graph::GraphView"
+                        and widget.isVisible() and widget.width() > 100):
+                    return widget
+            except Exception:
+                pass
+        return None
+
+    def _graph_view_id(self, graph):
+        uim = self._ui_mgr()
+        try:
+            for index in range(uim.getGraphViewIDCount()):
+                view_id = uim.getGraphViewIDAt(index)
+                view_graph = uim.getGraphFromGraphViewID(view_id)
+                if (view_graph is not None
+                        and view_graph.getIdentifier() == graph.getIdentifier()):
+                    return view_id
+        except Exception:
+            pass
+        return None
+
+    def _open_graph_view_for_preview(self, graph, wait_ms):
+        from PySide6.QtWidgets import QApplication
+        if QApplication.instance() is None:
+            raise RuntimeError("Qt application not available.")
+        try:
+            self._ui_mgr().openResourceInEditor(graph)
+        except Exception:
+            pass
+        self._pump_qt_events(max(100, int(wait_ms)))
+        graph_view = self._visible_graph_view()
+        if graph_view is None:
+            raise RuntimeError(
+                "Graph editor view not found. Open the graph in SD and retry.")
+        view_id = self._graph_view_id(graph)
+        if view_id is None:
+            raise RuntimeError(
+                "Graph view ID not found for '{}'. Open the graph in the SD "
+                "editor and retry.".format(graph.getIdentifier()))
+        return graph_view, view_id
+
+    def _graph_graphics_view(self, graph_view):
+        """Return the QGraphicsView that owns the graph scene."""
+        from PySide6.QtWidgets import QGraphicsView
+        if (hasattr(graph_view, "mapFromScene")
+                and hasattr(graph_view, "viewport")):
+            return graph_view
+        try:
+            candidates = [widget for widget in graph_view.findChildren(
+                QGraphicsView) if widget.isVisible() and widget.width() > 100]
+        except Exception:
+            candidates = []
+        return candidates[0] if candidates else None
+
+    def _node_view_global_rect(self, graph_view, bbox):
+        """Map an SD node bbox (scene coords) to a global screen QRect."""
+        from PySide6.QtCore import QPointF, QRect
+        view = self._graph_graphics_view(graph_view)
+        if view is None:
+            return None
+        x, y = float(bbox.x), float(bbox.y)
+        width, height = float(bbox.z), float(bbox.w)
+        top_left = view.mapFromScene(QPointF(x, y))
+        bottom_right = view.mapFromScene(QPointF(x + width, y + height))
+        rect = QRect(top_left, bottom_right).normalized()
+        viewport = view.viewport()
+        return QRect(viewport.mapToGlobal(rect.topLeft()),
+                     viewport.mapToGlobal(rect.bottomRight())).normalized()
+
+    @staticmethod
+    def _widget_matches_node(widget, node_id, label):
+        """True when a widget exposes the node's id/label in its Qt metadata."""
+        texts = []
+        for getter in ("objectName", "windowTitle", "accessibleName",
+                       "accessibleDescription", "statusTip", "toolTip"):
+            try:
+                value = getattr(widget, getter)()
+                if value:
+                    texts.append(str(value))
+            except Exception:
+                pass
+        for text in texts:
+            if (text == node_id
+                    or (label and text == label)
+                    or (node_id and node_id in text)):
+                return True
+        try:
+            meta = widget.metaObject()
+            for index in range(meta.propertyCount()):
+                try:
+                    name = meta.property(index).name()
+                    if name in ("objectName", "windowTitle"):
+                        continue
+                    value = widget.property(name)
+                    if not isinstance(value, str) or not value:
+                        continue
+                    if (value == node_id
+                            or (label and value == label)
+                            or (node_id and node_id in value)):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _find_node_preview_widget(self, graph_view, node, global_rect):
+        """Find a graph-owned preview widget for `node`, when SD exposes one.
+
+        SD 15 renders node previews directly in the graph view scene, so this
+        usually returns None and the caller crops the node tile instead. The
+        ancestor check keeps widgets from other docks (for example the PSD
+        exporter's layer-stack preview) from being matched by accident.
+        """
+        from PySide6.QtCore import QPoint, QRect
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app is None:
+            return None
+        view_rect = QRect(graph_view.mapToGlobal(QPoint(0, 0)),
+                          graph_view.size())
+        node_id = node.getIdentifier()
+        label = self._map_label(node)
+        geometric = []
+        for widget in app.allWidgets():
+            try:
+                class_name = widget.metaObject().className()
+                if (class_name
+                        != "Pfx::Editor::Components::Graph::PSD::PSDNodePreviewWidget"
+                        and "NodePreview" not in class_name):
+                    continue
+                if not widget.isVisible() or widget.width() <= 0 \
+                        or widget.height() <= 0:
+                    continue
+                if not graph_view.isAncestorOf(widget):
+                    continue
+                rect = QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+                if not view_rect.intersects(rect):
+                    continue
+                if self._widget_matches_node(widget, node_id, label):
+                    return widget
+                if global_rect is not None and global_rect.contains(
+                        rect.center()):
+                    geometric.append((rect.width() * rect.height(), widget))
+            except Exception:
+                continue
+        if geometric:
+            geometric.sort(key=lambda item: item[0], reverse=True)
+            return geometric[0][1]
+        return None
+
+    @staticmethod
+    def _grab_widget_image(widget):
+        try:
+            pixmap = widget.grab()
+        except Exception:
+            return None
+        if pixmap is None or pixmap.isNull():
+            return None
+        image = pixmap.toImage()
+        return None if image.isNull() else image
+
+    def _grab_node_preview(self, graph_view, view_id, node, wait_ms):
+        """Focus a node and return (QImage, capture_method).
+
+        Prefers a graph-owned preview widget when one exists; otherwise crops
+        the node tile from the graph view, which is SD 15's normal rendering.
+        """
+        from PySide6.QtCore import QRect, QRectF, Qt
+        uim = self._ui_mgr()
+        try:
+            uim.focusGraphNode(view_id, node)
+        except Exception:
+            pass
+        self._pump_qt_events(max(50, int(wait_ms)))
+
+        bbox = None
+        try:
+            bbox = uim.getGraphNodeBBox(view_id, node)
+        except Exception:
+            pass
+        global_rect = None
+        if bbox is not None:
+            try:
+                global_rect = self._node_view_global_rect(graph_view, bbox)
+            except Exception:
+                pass
+
+        widget = self._find_node_preview_widget(graph_view, node, global_rect)
+        if widget is not None:
+            image = self._grab_widget_image(widget)
+            if image is not None:
+                return image, "preview_widget"
+
+        view = self._graph_graphics_view(graph_view)
+        if bbox is None or view is None:
+            raise RuntimeError(
+                "Could not locate '{}' in the graph view. Make sure the graph "
+                "is open in the SD editor and its view is visible.".format(
+                    node.getIdentifier()))
+        scene_rect = QRectF(float(bbox.x), float(bbox.y),
+                            float(bbox.z), float(bbox.w))
+        saved_view = None
+        try:
+            saved_view = (
+                view.transform(),
+                view.horizontalScrollBar().value(),
+                view.verticalScrollBar().value(),
+            )
+            view.fitInView(scene_rect, Qt.KeepAspectRatio)
+            self._pump_qt_events(max(30, min(120, int(wait_ms) // 3)))
+        except Exception:
+            if saved_view is not None:
+                try:
+                    view.setTransform(saved_view[0])
+                    view.horizontalScrollBar().setValue(saved_view[1])
+                    view.verticalScrollBar().setValue(saved_view[2])
+                except Exception:
+                    pass
+            saved_view = None
+        try:
+            try:
+                rect = view.mapFromScene(scene_rect).boundingRect().intersected(
+                    view.viewport().rect())
+            except Exception as e:
+                raise RuntimeError(
+                    "Could not map the node bounds of '{}': {}".format(
+                        node.getIdentifier(), e))
+            if rect.isEmpty():
+                raise RuntimeError(
+                    "Node '{}' is outside the visible graph view.".format(
+                        node.getIdentifier()))
+            pixmap = view.viewport().grab()
+            if pixmap is None or pixmap.isNull():
+                raise RuntimeError("Graph view grab produced an empty image.")
+            image = pixmap.toImage()
+            if image.isNull():
+                raise RuntimeError("Graph view grab produced an empty image.")
+            ratio = float(pixmap.devicePixelRatio() or 1.0)
+            crop = QRect(
+                int(round(rect.x() * ratio)), int(round(rect.y() * ratio)),
+                max(1, int(round(rect.width() * ratio))),
+                max(1, int(round(rect.height() * ratio))))
+            image = image.copy(crop)
+            if image.isNull():
+                raise RuntimeError("Graph view crop produced an empty image.")
+            return image, "graph_view_crop"
+        finally:
+            if saved_view is not None:
+                try:
+                    view.setTransform(saved_view[0])
+                    view.horizontalScrollBar().setValue(saved_view[1])
+                    view.verticalScrollBar().setValue(saved_view[2])
+                except Exception:
+                    pass
+
+    def _gen_capture_node_preview(self, job, params):
+        graph = self._resolve_graph(params.get("graph_identifier"))
+        gid = graph.getIdentifier()
+        targets = self._capture_node_preview_nodes(
+            graph, params.get("node_id"), params.get("node_ids"))
+        max_size = params.get("max_size", 512)
+        output_path = params.get("output_path")
+        wait_ms = params.get("wait_ms", 250)
+
+        job["stages_total"] = 3 + len(targets)
+        job["stage"] = "open_editor"
+        job["progress"] = 0.05
+        yield
+        graph_view, view_id = self._open_graph_view_for_preview(graph, wait_ms)
+
+        tiles = []
+        skipped = []
+        for index, (node, label) in enumerate(targets):
+            job["stage"] = "grab_preview"
+            job["progress"] = round(
+                0.1 + 0.8 * index / max(1, len(targets)), 3)
+            yield
+            try:
+                image, capture = self._grab_node_preview(
+                    graph_view, view_id, node, wait_ms)
+            except Exception as e:
+                if len(targets) == 1:
+                    raise
+                skipped.append({"node": node.getIdentifier(),
+                                "label": label, "reason": str(e)})
+                continue
+            source_width, source_height = image.width(), image.height()
+            tiles.append({
+                "usage": "node_preview",
+                "label": label or node.getIdentifier(),
+                "node": node.getIdentifier(),
+                "port_id": None,
+                "source_width": source_width,
+                "source_height": source_height,
+                "capture": capture,
+                "image": self._downscale_preview(image, max_size),
+            })
+
+        if not tiles:
+            raise RuntimeError(
+                "No node previews could be captured on '{}'. {}".format(
+                    gid, skipped))
+
+        job["stage"] = "save"
+        job["progress"] = 0.95
+        yield
+        if len(targets) == 1:
+            tile = tiles[0]
+            if not output_path:
+                safe = re.sub(r'[^A-Za-z0-9]+', '_',
+                              tile["label"]).strip('_').lower()
+                output_path = self._default_output_path(
+                    "node_preview_" + safe if safe else "node_preview")
+            output_path = self._ensure_output_dir(output_path)
+            image = tile["image"]
+            if not image.save(output_path):
+                raise RuntimeError(
+                    "Failed to save image to '{}'.".format(output_path))
+            job["result"] = {
+                "path":          output_path,
+                "width":         image.width(),
+                "height":        image.height(),
+                "method":        "node_preview",
+                "capture":       tile["capture"],
+                "source_width":  tile["source_width"],
+                "source_height": tile["source_height"],
+                "graph":         gid,
+                "node":          tile["node"],
+                "label":         tile["label"],
+            }
+        else:
+            sheet = self._render_contact_sheet(
+                tiles, output_path, prefix="node_preview_sheet")
+            for item, tile in zip(sheet["items"], tiles):
+                item["capture"] = tile["capture"]
+            job["result"] = {
+                "path":    sheet["path"],
+                "width":   sheet["width"],
+                "height":  sheet["height"],
+                "method":  "node_preview_sheet",
+                "graph":   gid,
+                "columns": sheet["columns"],
+                "rows":    sheet["rows"],
+                "items":   sheet["items"],
+                "skipped": skipped,
+            }
+        job["stage"] = "done"
+        job["progress"] = 1.0
+
+    def get_map_stats(self, graph_identifier=None, node_id=None,
+                      output_usage=None, port_id=None, histogram_bins=16):
+        """Calculate per-channel statistics directly from an SDTexture buffer.
+
+        Runs the staged generator to completion synchronously; start_job
+        ("get_map_stats") runs the same stages step-by-step with progress and
+        between-stage cancellation.
+
+        min/max/mean/count are exact; histograms of 16-bit/float maps larger
+        than ~1M pixels are counted from evenly strided samples
+        (histogram.sample_stride reports the stride; 1 = every pixel counted).
+        """
+        job = {"stage": "resolve_graph", "progress": 0.0,
+               "stages_total": 0, "result": None}
+        self._drive_sync(self._gen_get_map_stats(job, {
+            "graph_identifier": graph_identifier,
+            "node_id": node_id,
+            "output_usage": output_usage,
+            "port_id": port_id,
+            "histogram_bins": histogram_bins,
+        }), job)
+        return job["result"]
+
+    def _gen_get_map_stats(self, job, params):
+        graph_identifier = params.get("graph_identifier")
+        node_id          = params.get("node_id")
+        output_usage     = params.get("output_usage")
+        port_id          = params.get("port_id")
+        histogram_bins   = params.get("histogram_bins", 16)
+
+        graph = self._resolve_graph(graph_identifier)
+        node, label = self._find_map_node(
+            graph, node_id=node_id, output_usage=output_usage)
+        job["stages_total"] = 4   # resolve, compute, select, stats
+        job["stage"] = "compute"
+        yield
+        try:
+            graph.compute()
+        except Exception as e:
+            raise RuntimeError(
+                "graph.compute() failed for '{}': {}".format(
+                    graph.getIdentifier(), e))
+        selected_port, texture = self._select_map_texture(node, port_id)
+
+        job["stage"] = "stats"
+        job["progress"] = 0.85
+        yield
+        result = {
+            "graph": graph.getIdentifier(),
+            "node": node.getIdentifier(),
+            "port_id": selected_port,
+            "label": label,
+        }
+        result.update(self._texture_stats(texture, histogram_bins))
+        job["stage"] = "done"
+        job["progress"] = 1.0
+        job["result"] = result
+
+    def inspect_outputs(self, graph_identifier=None, output_usages=None,
+                        max_size=1024, histogram_bins=16, output_path=None):
+        """Compute the graph once and return a contact sheet plus per-channel
+        statistics for the requested outputs.
+
+        Runs the staged generator to completion synchronously; start_job
+        ("inspect_outputs") runs the same stages step-by-step with progress
+        and between-stage cancellation.
+
+        capture_2d_view(output_usages=...) and get_map_stats each compute the
+        graph on their own; this combined inspection computes once and reads
+        both the preview tiles and the pixel buffers from the same textures.
+        Defaults to the four common PBR outputs; outputs that cannot be
+        matched or read are reported in 'skipped' instead of failing the call.
+
+        min/max/mean/count are exact; histograms of 16-bit/float maps larger
+        than ~1M pixels are counted from evenly strided samples
+        (histogram.sample_stride reports the stride; 1 = every pixel counted).
+
+        Returns {graph, path, width, height, method, histogram_bins, columns,
+        rows, outputs: [{usage, label, node, port_id, source_width,
+        source_height, width, height, pixel_format, value_domain, channels}],
+        skipped}.
+        """
+        job = {"stage": "resolve_graph", "progress": 0.0,
+               "stages_total": 0, "result": None}
+        self._drive_sync(self._gen_inspect_outputs(job, {
+            "graph_identifier": graph_identifier,
+            "output_usages": output_usages,
+            "max_size": max_size,
+            "histogram_bins": histogram_bins,
+            "output_path": output_path,
+        }), job)
+        return job["result"]
+
+    def _gen_inspect_outputs(self, job, params):
+        graph_identifier = params.get("graph_identifier")
+        output_usages    = params.get("output_usages")
+        max_size         = params.get("max_size", 1024)
+        histogram_bins   = params.get("histogram_bins", 16)
+        output_path      = params.get("output_path")
+
+        if output_usages is None:
+            usages = ["height", "normal", "ambientOcclusion", "baseColor"]
+        else:
+            usages = [str(usage) for usage in output_usages
+                      if str(usage).strip()]
+        if not usages:
+            raise ValueError("Pass at least one output usage.")
+        if len(usages) > 16:
+            raise ValueError("Pass between 1 and 16 output_usages.")
+        bins = int(histogram_bins)
+        if bins < 1 or bins > 512:
+            raise ValueError("histogram_bins must be between 1 and 512.")
+
+        graph = self._resolve_graph(graph_identifier)
+        gid = graph.getIdentifier()
+        job["stages_total"] = 3 + len(usages) + 1   # resolve, compute, per-output, sheet
+        job["stage"] = "compute"
+        yield
+        try:
+            graph.compute()
+        except Exception as e:
+            raise RuntimeError(
+                "graph.compute() failed for '{}': {}".format(gid, e))
+
+        def _norm(value):
+            return "".join(c for c in (value or "").lower() if c.isalnum())
+
+        aliases = {"ao": "ambientocclusion"}
+        try:
+            array = graph.getOutputNodes()
+            out_nodes = [array.getItem(i) for i in range(array.getSize())]
+        except Exception:
+            out_nodes = [n for n in graph.getNodes()
+                         if self._get_node_def_id(n)
+                         == "sbs::compositing::output"]
+        by_label = {}
+        for out_node in out_nodes:
+            label = self._map_label(out_node)
+            by_label.setdefault(
+                aliases.get(_norm(label), _norm(label)), out_node)
+
+        tiles = []
+        outputs = []
+        skipped = []
+        for index, usage in enumerate(usages):
+            job["stage"] = "read_output"
+            job["progress"] = round(0.1 + 0.7 * index / len(usages), 3)
+            yield
+            want = aliases.get(_norm(usage), _norm(usage))
+            node = by_label.get(want)
+            if node is None:
+                skipped.append({
+                    "usage": usage,
+                    "reason": "no output node matches; available: {}".format(
+                        sorted(label for label in by_label if label))})
+                continue
+            try:
+                pid, texture = self._select_map_texture(node)
+                stats = self._texture_stats(texture, bins)
+                image = self._map_texture_to_qimage(texture)
+                src_w, src_h = image.width(), image.height()
+                label = self._map_label(node) or usage
+                tiles.append({"usage": usage, "label": label,
+                              "node": node.getIdentifier(), "port_id": pid,
+                              "source_width": src_w, "source_height": src_h,
+                              "image": self._downscale_preview(
+                                  image, max_size)})
+                item = {"usage": usage, "label": label,
+                        "node": node.getIdentifier(), "port_id": pid,
+                        "source_width": src_w, "source_height": src_h}
+                item.update(stats)
+                outputs.append(item)
+            except Exception as e:
+                skipped.append({"usage": usage, "reason": str(e)})
+
+        if not outputs:
+            raise ValueError(
+                "None of the requested outputs could be inspected on '{}'. "
+                "Available outputs: {}.".format(
+                    gid, sorted(label for label in by_label if label)))
+
+        job["stage"] = "render_sheet"
+        job["progress"] = 0.9
+        yield
+        sheet = self._render_contact_sheet(
+            tiles, output_path, prefix="inspect_outputs")
+        job["stage"] = "done"
+        job["progress"] = 1.0
+        job["result"] = {"graph": gid,
+                         "path": sheet["path"],
+                         "width": sheet["width"],
+                         "height": sheet["height"],
+                         "method": "inspect_outputs",
+                         "histogram_bins": bins,
+                         "columns": sheet["columns"],
+                         "rows": sheet["rows"],
+                         "outputs": outputs,
+                         "skipped": skipped}
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── STAGED LONG JOBS (progress + between-stage cancellation) ────────
+    # ═══════════════════════════════════════════════════════════════════════
+    #
+    # capture_2d_view / get_map_stats / inspect_outputs are step-through
+    # generators of stages executed on the Qt main thread (the compute stage
+    # still blocks it, SD's constraint). _drive_sync runs one in-line to keep
+    # the direct tools' exactly previous behavior; start_job schedules the
+    # same generator one stage per QTimer tick, so status/cancel commands can
+    # interleave between stages and progress is user-visible.
+
+    _JOB_FACTORIES = {
+        "capture_2d_view":       "_gen_capture_2d_view",
+        "capture_node_preview":  "_gen_capture_node_preview",
+        "get_map_stats":         "_gen_get_map_stats",
+        "inspect_outputs":       "_gen_inspect_outputs",
+    }
+
+    def _drive_sync(self, gen, job):
+        """Run a staged generator to completion (one next() per stage)."""
+        job.setdefault("done", False)
+        tries = 0
+        while not job["done"] and tries <= 64:
+            tries += 1
+            try:
+                next(gen)
+            except StopIteration:
+                job["done"] = True
+        if not job["done"]:
+            job["done"] = True
+
+    def start_job(self, op, params=None):
+        """Start a heavy inspection op as a staged background job.
+
+        The job steps one stage per QTimer tick on SD's main thread; while any
+        single stage runs (notably graph.compute()), queued commands wait.
+        job_status/job_cancel interleave between stages. Returns
+        {job_id, op, started} immediately.
+        """
+        if _QTimer is None:
+            raise RuntimeError("No Qt binding: long jobs unavailable; use the "
+                               "direct blocking tools instead.")
+        factory_name = self._JOB_FACTORIES.get(op)
+        if factory_name is None:
+            raise ValueError("Unknown job op '{}'. Available: {}".format(
+                op, sorted(self._JOB_FACTORIES)))
+
+        with self._jobs_lock:
+            seq = self._job_seq + 1
+            self._job_seq = seq
+            jobs = self._jobs
+            # Bound the registry: prune finished records when it grows large.
+            if len(jobs) >= 32:
+                for key in sorted(jobs, key=int):
+                    if jobs[key][0]["done"]:
+                        del jobs[key]
+                    if len(jobs) < 32:
+                        break
+
+        job = {"job_id": seq, "op": op, "done": False, "cancelled": False,
+               "stage": "queued", "stage_index": 0, "stages_total": 0,
+               "progress": 0.0, "result": None, "error": None}
+        params = dict(params or {})
+        gen = getattr(self, factory_name)(job, params)
+
+        def _step():
+            with self._jobs_lock:
+                cancelled = job["cancelled"]
+                done = job["done"]
+            if cancelled:
+                try:
+                    gen.close()
+                except Exception:
+                    pass
+                with self._jobs_lock:
+                    job["done"] = True
+                return
+            if done:
+                return
+            try:
+                next(gen)
+            except StopIteration:
+                with self._jobs_lock:
+                    job["done"] = True
+                return
+            except Exception as e:
+                with self._jobs_lock:
+                    job["done"] = True
+                    job["error"] = "{}: {}".format(type(e).__name__, e)
+                return
+            with self._jobs_lock:
+                if job["done"]:
+                    return
+                job["stage_index"] = int(job.get("stage_index", 0)) + 1
+                if not job.get("stages_total"):
+                    job["stages_total"] = job["stage_index"] + 1
+            _QTimer.singleShot(0, _step)
+
+        with self._jobs_lock:
+            self._jobs[seq] = (job, gen)
+        _QTimer.singleShot(0, _step)
+        return {"job_id": seq, "op": op, "started": True,
+                "note": "poll with job_status or the bridge's wait_long_job"}
+
+    def job_status(self, job_id=None):
+        """Progress of a staged long job (latest when job_id is None).
+
+        Returns {job_id, op, done, cancelled, stage, stage_index, stages_total,
+        progress, result?, error?}. result holds the tool's normal result once
+        done without error.
+        """
+        with self._jobs_lock:
+            jobs = self._jobs
+            if not jobs:
+                raise ValueError("No long jobs have been started.")
+            if job_id is None:
+                record = max(jobs.items(), key=lambda kv: int(kv[0]))[1]
+            else:
+                record = jobs.get(int(job_id))
+            if record is None:
+                raise ValueError(
+                    "Unknown job {}. Started: {}".format(
+                        job_id, sorted(int(k) for k in jobs)))
+            return dict(record[0])
+
+    def job_cancel(self, job_id):
+        """Request cancellation of a staged long job. It stops between stages
+        (graph.compute() itself cannot be interrupted mid-flight)."""
+        with self._jobs_lock:
+            record = self._jobs.get(int(job_id))
+            if record is None:
+                raise ValueError("Unknown job {}. Started: {}".format(
+                    job_id, sorted(int(k) for k in self._jobs)))
+            job = record[0]
+            ret = dict(job)
+            if job["done"]:
+                ret["note"] = "Job already finished."
+            else:
+                job["cancelled"] = True
+                ret["note"] = ("Cancellation requested; it takes effect between "
+                               "stages, after any running stage completes.")
+            return ret
+
+    # ═══════════════════════════════════════════════════════════════════════
     # ── 3D VIEW MATERIAL BINDING ────────────────────────────────────────
     # ═══════════════════════════════════════════════════════════════════════
 
@@ -1946,6 +3555,15 @@ class CommandHandler:
         # Library cache
         results["library_cache_entries"] = len(self._lib_url_cache)
 
+        # Security gates and config
+        results["execute_code_enabled"] = self._execute_code_allowed()
+        results["dev_tools_enabled"] = self._dev_tools_allowed()
+        results["token_auth_required"] = bool(
+            os.environ.get("SD_MCP_TOKEN"))
+        results["plugin_ports"] = sorted(getattr(_server, "listeners", {}))
+        results["command_timeout"] = COMMAND_TIMEOUT
+        results["command_timeout_max"] = COMMAND_TIMEOUT_MAX
+
         # Current graph
         try:
             g = self._ui_mgr().getCurrentGraph()
@@ -2016,20 +3634,40 @@ class CommandHandler:
                 except Exception:
                     pass
 
+    def _guard_atomic_definition(self, definition_id, known_defs, hint=""):
+        """Refuse newNode() unless definition_id is validated against known_defs.
+
+        Unknown definitions can hang SD 15, so an introspection failure or an
+        empty definition list must fail closed instead of calling newNode().
+        """
+        if not known_defs:
+            raise RuntimeError(
+                "Cannot validate definition '{}': the graph reported no node "
+                "definitions. Refusing to call newNode() with an unvalidated "
+                "definition — unknown definitions can hang SD 15.".format(
+                    definition_id))
+        if definition_id not in known_defs:
+            message = "Unknown definition '{}'.".format(definition_id)
+            if hint:
+                message += " " + hint
+            raise ValueError(message)
+
     def create_node(self, definition_id, graph_identifier=None, position=None):
         graph = self._resolve_graph(graph_identifier)
         # Validate before calling newNode — unknown defs HANG SD 15
         try:
             known = {d.getId() for d in list(graph.getNodeDefinitions())}
-            if definition_id not in known:
-                raise ValueError(
-                    "Unknown definition '{}'. "
-                    "Library nodes require create_instance_node with pkg:// URL.".format(
-                        definition_id))
-        except ValueError:
-            raise
-        except Exception:
-            pass
+        except Exception as e:
+            raise RuntimeError(
+                "Cannot validate definition '{}': graph.getNodeDefinitions() "
+                "failed ({}). Refusing to call newNode() with an unvalidated "
+                "definition — unknown definitions can hang SD 15.".format(
+                    definition_id, e))
+        if definition_id not in known:
+            raise ValueError(
+                "Unknown definition '{}'. "
+                "Library nodes require create_instance_node with pkg:// URL.".format(
+                    definition_id))
 
         node = graph.newNode(definition_id)
         if not node:
@@ -2363,27 +4001,57 @@ class CommandHandler:
     # ── PARAMETER TOOLS ─────────────────────────────────────────────────
     # ═══════════════════════════════════════════════════════════════════════
 
-    def set_parameter(self, node_id, parameter_id, value, value_type="float",
-                      graph_identifier=None):
-        graph = self._resolve_graph(graph_identifier)
-        node  = self._find_node(graph, node_id)
+    def _node_property_ids(self, node):
+        """(input, annotation) property type maps of a node: id -> SDType id.
 
-        input_ids  = set()
-        annot_ids  = set()
+        The SDType ids feed _coerce_type when setting values, because SD 15
+        silently crashes (kills the whole execution) on wrong SDValue types.
+        """
+        input_types = {}
+        annot_types = {}
         try:
             for p in list(node.getProperties(SDPropertyCategory.Input)):
-                input_ids.add(p.getId())
+                pid = p.getId()
+                try:
+                    t = p.getType()
+                    input_types[pid] = t.getId() if t else ""
+                except Exception:
+                    input_types[pid] = ""
         except Exception:
             pass
         try:
             for p in list(node.getProperties(SDPropertyCategory.Annotation)):
-                annot_ids.add(p.getId())
+                pid = p.getId()
+                try:
+                    t = p.getType()
+                    annot_types[pid] = t.getId() if t else ""
+                except Exception:
+                    annot_types[pid] = ""
         except Exception:
             pass
+        return input_types, annot_types
+
+    def _apply_parameter(self, node, parameter_id, value, value_type="float",
+                         input_types=None, annot_types=None):
+        """Set one parameter on an already-resolved node.
+
+        Shared by set_parameter and set_parameters; input_types/annot_types
+        (id -> SDType id maps from _node_property_ids) may be passed in when
+        one node receives several parameters in a batch.
+
+        The setter is chosen by property category and the value type is
+        coerced to the actual SD property type: SD 15 silently crashes the
+        whole execution call when a property is set through the wrong setter
+        or with an SDValue of the wrong type.
+        Returns {parameter_id, value, value_type[, renamed_from]}.
+        """
+        if input_types is None or annot_types is None:
+            input_types, annot_types = self._node_property_ids(node)
+        node_id = node.getIdentifier()
 
         orig_parameter_id = parameter_id
         parameter_id, value_factor, renamed = self._resolve_param_id(
-            parameter_id, {i: "" for i in input_ids}, {i: "" for i in annot_ids})
+            parameter_id, input_types, annot_types)
         if value_factor != 1.0 and isinstance(value, (int, float)) \
                 and abs(value) <= 1.0:
             value = value * value_factor
@@ -2391,23 +4059,30 @@ class CommandHandler:
             _log("Param '{}' -> '{}' on '{}'".format(
                 orig_parameter_id, parameter_id, node_id))
 
-        sd_value = self._make_sd_value(value_type, value)
-
-        if (input_ids or annot_ids) and \
-           parameter_id not in input_ids and parameter_id not in annot_ids:
-            all_ids = sorted(input_ids | annot_ids)
+        if (input_types or annot_types) and \
+           parameter_id not in input_types and parameter_id not in annot_types:
+            all_ids = sorted(set(input_types) | set(annot_types))
             raise ValueError(
                 "Property '{}' not found on node '{}'. Available: {}".format(
                     parameter_id, node_id, all_ids))
 
+        sd_type_id = input_types.get(parameter_id) \
+            or annot_types.get(parameter_id) or ""
+        value_type = _coerce_type(value_type, value, sd_type_id)
+        sd_value = self._make_sd_value(value_type, value)
+
         set_ok = False
         last_err = None
-        for setter in [node.setInputPropertyValueFromId,
-                       node.setAnnotationPropertyValueFromId]:
+        if parameter_id in input_types:
             try:
-                setter(parameter_id, sd_value)
+                node.setInputPropertyValueFromId(parameter_id, sd_value)
                 set_ok = True
-                break
+            except Exception as e:
+                last_err = e
+        if not set_ok and parameter_id in annot_types:
+            try:
+                node.setAnnotationPropertyValueFromId(parameter_id, sd_value)
+                set_ok = True
             except Exception as e:
                 last_err = e
 
@@ -2416,7 +4091,6 @@ class CommandHandler:
                 parameter_id, node_id, last_err))
 
         result = {
-            "node_id":      node_id,
             "parameter_id": parameter_id,
             "value":        value,
             "value_type":   value_type,
@@ -2424,6 +4098,62 @@ class CommandHandler:
         if renamed:
             result["renamed_from"] = orig_parameter_id
         return result
+
+    def set_parameter(self, node_id, parameter_id, value, value_type="float",
+                      graph_identifier=None):
+        graph = self._resolve_graph(graph_identifier)
+        node  = self._find_node(graph, node_id)
+
+        result = {"node_id": node_id}
+        result.update(self._apply_parameter(
+            node, parameter_id, value, value_type))
+        return result
+
+    def set_parameters(self, updates, graph_identifier=None):
+        """Set several parameters in one call, resolving the graph and each
+        node once. Individual failures do not abort the batch; every update
+        reports its own status.
+
+        updates: list of {node_id, parameter_id, value[, value_type]} dicts
+        (same parameter IDs and value types as set_parameter).
+        Returns {graph, applied, failed, results}.
+        """
+        graph = self._resolve_graph(graph_identifier)
+        if not updates:
+            raise ValueError("Pass at least one update.")
+        node_cache = {}
+        results = []
+        applied = 0
+        failed  = 0
+        for update in updates:
+            node_id      = update.get("node_id")
+            parameter_id = update.get("parameter_id")
+            value        = update.get("value")
+            value_type   = update.get("value_type", "float")
+            entry = {"node_id": node_id, "parameter_id": parameter_id,
+                     "value": value, "value_type": value_type}
+            try:
+                if not node_id or not parameter_id:
+                    raise ValueError(
+                        "Each update needs 'node_id' and 'parameter_id'.")
+                cached = node_cache.get(node_id)
+                if cached is None:
+                    node = self._find_node(graph, node_id)
+                    cached = (node,) + self._node_property_ids(node)
+                    node_cache[node_id] = cached
+                node, input_types, annot_types = cached
+                entry.update(self._apply_parameter(
+                    node, parameter_id, value, value_type,
+                    input_types=input_types, annot_types=annot_types))
+                entry["status"] = "ok"
+                applied += 1
+            except Exception as e:
+                entry["status"] = "error"
+                entry["error"] = str(e)
+                failed += 1
+            results.append(entry)
+        return {"graph": graph.getIdentifier(), "applied": applied,
+                "failed": failed, "results": results}
 
     def set_graph_output_size(self, width_log2=11, height_log2=11, graph_identifier=None):
         graph = self._resolve_graph(graph_identifier)
@@ -2442,13 +4172,151 @@ class CommandHandler:
     # ── BATCH GRAPH BUILDER ─────────────────────────────────────────────
     # ═══════════════════════════════════════════════════════════════════════
 
+    def _preflight_batch_graph(self, nodes, connections, known_defs):
+        """Validate as much of a batch plan as possible WITHOUT creating a
+        graph: definitions against `known_defs`, library URLs/keywords
+        resolved (auto-loading library packages), parameter value shapes, and
+        for endpoints in the known ATOMIC_PORTS registry, port IDs.
+
+        Returns (errors, warnings, counts)."""
+        errors   = []
+        warnings = []
+        alias_ports = {}    # alias -> (inputs, outputs) OR None when ports unknown
+        alias_names = []
+        _VEC_SIZES = {"float2": 2, "float3": 3, "float4": 4,
+                      "int2": 2, "int3": 3, "int4": 4, "color": 4}
+
+        for index, spec in enumerate(nodes):
+            defn_id = spec.get("definition_id")
+            alias   = spec.get("id_alias") or spec.get("alias") or (
+                (defn_id.split("::")[-1]) if defn_id else "node_{}".format(index))
+            if alias in alias_ports:
+                warnings.append({
+                    "kind": "alias_duplicate", "node": alias, "index": index,
+                    "message": "duplicate alias; it will be renamed automatically."})
+                suffix = 1
+                while "{}_{}".format(alias, suffix) in alias_ports:
+                    suffix += 1
+                alias = "{}_{}".format(alias, suffix)
+            alias_names.append(alias)
+
+            res_url = spec.get("resource_url")
+            lib_kw  = spec.get("library_keyword")
+
+            if defn_id == "sbs::compositing::output":
+                reg = ATOMIC_PORTS["sbs::compositing::output"]
+                alias_ports[alias] = (reg["inputs"], reg["outputs"])
+            elif bool(res_url) == bool(lib_kw) and (res_url or lib_kw):
+                errors.append({
+                    "kind": "conflicting_sources", "node": alias,
+                    "message": "set either resource_url or library_keyword, not both."})
+                alias_ports[alias] = None
+            elif res_url:
+                resource, _resolved = self._resolve_res_url(res_url)
+                if not resource:
+                    errors.append({
+                        "kind": "resource_not_found", "node": alias,
+                        "message": "resource URL '{}' not found.".format(res_url)})
+                alias_ports[alias] = None     # library ports known only after instancing
+            elif lib_kw:
+                try:
+                    url = self._resolve_lib_url(lib_kw)
+                except Exception as e:
+                    errors.append({
+                        "kind": "library_not_found", "node": alias,
+                        "message": "library keyword '{}' could not be "
+                                   "resolved: {}".format(lib_kw, e)})
+                else:
+                    if not url:
+                        errors.append({
+                            "kind": "library_not_found", "node": alias,
+                            "message": "library keyword '{}' not found.".format(lib_kw)})
+                alias_ports[alias] = None
+            else:
+                defn_id = defn_id or "sbs::compositing::uniform"
+                reg = ATOMIC_PORTS.get(defn_id)
+                if reg is not None:
+                    alias_ports[alias] = (reg["inputs"], reg["outputs"])
+                elif defn_id in known_defs:
+                    alias_ports[alias] = None   # known, outside our registry check
+                else:
+                    known = sorted(known_defs or [])
+                    errors.append({
+                        "kind": "unknown_definition", "node": alias,
+                        "message": "definition '{}' is not available in a new "
+                                   "graph (known: seen {} ids, e.g. {}). "
+                                   "Library nodes need resource_url or "
+                                   "library_keyword.".format(
+                                       defn_id, len(known), ", ".join(known[:12]))})
+                    alias_ports[alias] = None
+
+            params = spec.get("parameters") or {}
+            for param_id, pspec in params.items():
+                if isinstance(pspec, dict) and "value" in pspec:
+                    pval, ptype = pspec["value"], pspec.get("type")
+                else:
+                    pval, ptype = pspec, None
+                if ptype is None:
+                    ptype = _infer_type(pval)
+                size = _VEC_SIZES.get(ptype)
+                if size and (not isinstance(pval, (list, tuple)) or len(pval) != size):
+                    errors.append({
+                        "kind": "parameter_shape", "node": alias,
+                        "param": param_id,
+                        "message": "{} needs a {}-element list, got {!r}.".format(
+                            ptype, size, pval)})
+
+        for index, conn in enumerate(connections):
+            fa = conn.get("from") or conn.get("from_alias")
+            ta = conn.get("to") or conn.get("to_alias")
+            fo = conn.get("from_output", "unique_filter_output")
+            ti = conn.get("to_input", "input1")
+            ok = True
+            for role, alias in (("from", fa), ("to", ta)):
+                if alias not in alias_ports:
+                    ok = False
+                    errors.append({
+                        "kind": "alias_not_found", "connection": index,
+                        "message": "{} alias '{}' not in nodes list; known: "
+                                   "{}.".format(role, alias, sorted(alias_ports))})
+            if not ok or fa == ta:
+                if fa == ta and ok:
+                    errors.append({
+                        "kind": "self_connection", "connection": index,
+                        "message": "'{}' connects to itself.".format(fa)})
+                continue
+            f_ports = alias_ports.get(fa)
+            t_ports = alias_ports.get(ta)
+            if f_ports and fo not in f_ports[1]:
+                errors.append({
+                    "kind": "unknown_port", "connection": index, "node": fa,
+                    "message": "output port '{}' not in the known outputs of "
+                               "'{}' ({}). Single-output library nodes "
+                               "auto-resolve at build time.".format(
+                                   fo, fa, f_ports[1])})
+            if t_ports and ti not in t_ports[0]:
+                errors.append({
+                    "kind": "unknown_port", "connection": index, "node": ta,
+                    "message": "input port '{}' not in the known inputs of "
+                               "'{}' ({}).".format(ti, ta, t_ports[0])})
+
+        return errors, warnings, {
+            "nodes_checked": len(nodes),
+            "connections_checked": len(connections),
+        }
+
     def create_batch_graph(self, graph_name, package_index=0, package_path=None,
                            nodes=None, connections=None, output_size_log2=11,
-                           open_in_editor=True):
+                           open_in_editor=True, preflight=False,
+                           cleanup_on_failure=False):
         """
         Create a complete graph in one call.
         Supports atomic nodes, library nodes (via resource_url or keyword),
         output nodes, and full connection wiring.
+        preflight: validate the plan without creating a graph; returns
+        valid/errors/warnings and never touches the editor.
+        cleanup_on_failure: if any node or connection fails, delete the new
+        graph and raise with the report.
         """
         if nodes is None:
             nodes = []
@@ -2457,6 +4325,39 @@ class CommandHandler:
 
         safe_name = _sanitize_identifier(graph_name)
         pkg   = self._resolve_package(package_index, package_path)
+
+        if preflight:
+            temp_pkg = self._pkg_mgr().newUserPackage()
+            try:
+                temp_graph = SDSBSCompGraph.sNew(temp_pkg)
+                temp_graph.setIdentifier("_TempPreflight")
+                try:
+                    known_defs = {d.getId() for d in list(temp_graph.getNodeDefinitions())}
+                except Exception:
+                    known_defs = set()
+            except Exception:
+                known_defs = set()
+            finally:
+                try:
+                    self._pkg_mgr().unloadUserPackage(temp_pkg)
+                except Exception:
+                    pass
+            errors, warnings, counts = self._preflight_batch_graph(
+                nodes, connections, known_defs)
+            result = {
+                "preflight":        True,
+                "requested_name":   graph_name,
+                "graph_name":       safe_name,
+                "valid":            not errors,
+                "errors":           errors,
+                "warnings":         warnings,
+                "error_count":      len(errors),
+                "warning_count":    len(warnings),
+                "package":          pkg.getFilePath(),
+            }
+            result.update(counts)
+            return result
+
         graph = SDSBSCompGraph.sNew(pkg)
         graph.setIdentifier(safe_name)
 
@@ -2512,9 +4413,9 @@ class CommandHandler:
                     node = self._create_library_node(graph, lib_kw)
 
                 else:
-                    if _known_defs and defn_id not in _known_defs:
-                        raise ValueError("Unknown definition '{}'. "
-                                         "Use library_keyword for library nodes.".format(defn_id))
+                    self._guard_atomic_definition(
+                        defn_id, _known_defs,
+                        hint="Use library_keyword for library nodes.")
                     node = graph.newNode(defn_id)
 
                 if not node:
@@ -2568,6 +4469,23 @@ class CommandHandler:
             except Exception as e:
                 conn_results.append({"from": fa, "to": ta, "success": False, "error": str(e)})
 
+        if (failed or any(not c.get("success") for c in conn_results)) and cleanup_on_failure:
+            removed_note = "The new graph was deleted."
+            try:
+                graph.delete()
+            except Exception as e:
+                removed_note = ("The new graph could NOT be deleted ({}: {}); "
+                                "it may remain in the package."
+                                .format(type(e).__name__, e))
+            raise RuntimeError(
+                "Batch graph '{}' failed: {} node error(s), {} connection "
+                "error(s). cleanup_on_failure: {}. First errors: nodes={}, "
+                "connections={}".format(
+                    safe_name, len(failed),
+                    sum(1 for c in conn_results if not c.get("success")),
+                    removed_note, failed[:3],
+                    [c for c in conn_results if not c.get("success")][:3]))
+
         if open_in_editor:
             try:
                 self._ui_mgr().openResourceInEditor(graph)
@@ -2597,10 +4515,13 @@ class CommandHandler:
     def build_material_graph(self, graph_name, recipe_name,
                               package_index=0, package_path=None,
                               overrides=None, output_size_log2=11,
-                              open_in_editor=True):
+                              open_in_editor=True, preflight=False,
+                              cleanup_on_failure=True):
         """
         Build a complete PBR material graph from a named recipe.
         overrides: dict of parameter overrides applied on top of recipe defaults.
+        preflight: validate the recipe plan without creating a graph.
+        cleanup_on_failure: delete the new graph if the build fails.
         """
         from .recipes import RECIPE_REGISTRY
         recipe_name_key = recipe_name.lower().replace(" ", "_").replace("-", "_")
@@ -2630,16 +4551,21 @@ class CommandHandler:
             connections      = connections,
             output_size_log2 = output_size_log2,
             open_in_editor   = open_in_editor,
+            preflight        = preflight,
+            cleanup_on_failure = cleanup_on_failure,
         )
 
     def build_heightmap_graph(self, graph_name, style,
                                package_index=0, package_path=None,
                                output_size_log2=11, open_in_editor=True,
-                               detail_level=2, scale=5.0, disorder=0.5):
+                               detail_level=2, scale=5.0, disorder=0.5,
+                               preflight=False, cleanup_on_failure=True):
         """
         Build a heightmap graph for terrain/rock/cliff styles.
         style: 'cliff', 'rock', 'cracked', 'sand', 'mud', 'mountain', 'cobblestone'
         detail_level: 1=basic, 2=standard, 3=high detail
+        preflight: validate the recipe plan without creating a graph.
+        cleanup_on_failure: delete the new graph if the build fails.
         """
         from .recipes import HEIGHTMAP_RECIPES
         style_key = style.lower().replace(" ", "_")
@@ -2660,6 +4586,8 @@ class CommandHandler:
             connections      = connections,
             output_size_log2 = output_size_log2,
             open_in_editor   = open_in_editor,
+            preflight        = preflight,
+            cleanup_on_failure = cleanup_on_failure,
         )
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -2793,8 +4721,9 @@ class CommandHandler:
                 elif lib_kw:
                     node = self._create_library_node(graph, lib_kw)
                 else:
-                    if _known_defs and defn_id not in _known_defs:
-                        raise ValueError("Unknown definition '{}'.".format(defn_id))
+                    self._guard_atomic_definition(
+                        defn_id, _known_defs,
+                        hint="Use library_keyword for library nodes.")
                     node = graph.newNode(defn_id)
 
                 if not node:
@@ -2923,6 +4852,18 @@ class CommandHandler:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    def _dev_tools_allowed(self):
+        """Whether development tools (reload_plugin) are opted in.
+
+        reload_plugin re-executes Python from disk, so it is gated like
+        execute_code: SD_MCP_ALLOW_DEV_TOOLS=1 in SD's environment, or the
+        execute-code opt-in (env or marker file).
+        """
+        if os.environ.get("SD_MCP_ALLOW_DEV_TOOLS", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            return True
+        return self._execute_code_allowed()
+
     def reload_plugin(self, handlers=True):
         """Hot-reload the plugin from disk without restarting SD.
 
@@ -2933,7 +4874,17 @@ class CommandHandler:
         invoker must stay the one created on the main thread), so the bridge
         connection is unaffected. Changes to SDMCPServer / the dispatcher
         themselves still need an SD restart.
+
+        Development-only: requires SD_MCP_ALLOW_DEV_TOOLS=1 (or the
+        execute_code opt-in) in SD's environment, plus --allow-dev-tools on
+        the bridge.
         """
+        if not self._dev_tools_allowed():
+            raise ValueError(
+                "reload_plugin is disabled. Set SD_MCP_ALLOW_DEV_TOOLS=1 in "
+                "SD's environment (or enable the execute_code opt-in) and "
+                "restart the bridge with --allow-dev-tools; reload_plugin "
+                "re-executes Python from disk.")
         pkg_name = __name__
         pkg = sys.modules[pkg_name]
         reloaded = []
@@ -2966,7 +4917,6 @@ class CommandHandler:
 
         new_handler = pkg.CommandHandler()
         new_handler._lib_url_cache  = self._lib_url_cache
-        new_handler._library_loaded = self._library_loaded
         if server is not None:
             server._handler = new_handler
         _log("Plugin reloaded from {}".format(src_path))
@@ -2977,8 +4927,38 @@ class CommandHandler:
         })
         return result
 
+    def _execute_code_allowed(self):
+        """Whether arbitrary-code execution is opted in on the plugin side.
+
+        Two opt-ins (separate from the bridge's flag, which only arms the MCP
+        tool): SD_MCP_ALLOW_EXECUTE_CODE=1 in SD's environment, or an
+        'allow_execute_code' file (content ignored) placed in the plugin
+        folder.
+        """
+        if os.environ.get("SD_MCP_ALLOW_EXECUTE_CODE", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            return True
+        try:
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            if os.path.isfile(os.path.join(plugin_dir, "allow_execute_code")):
+                return True
+        except Exception:
+            pass
+        return False
+
     def execute_code(self, code):
-        """Execute arbitrary Python on the SD main thread. Keep it short."""
+        """Execute arbitrary Python on the SD main thread. Opt-in only: the
+        bridge must run with --allow-arbitrary-code AND the plugin must be
+        opted in (SD_MCP_ALLOW_EXECUTE_CODE=1 or an allow_execute_code marker
+        file in the plugin folder). Keep the code short: it blocks SD."""
+        if not self._execute_code_allowed():
+            raise ValueError(
+                "execute_code is disabled. Ask the user to opt in on BOTH "
+                "sides: restart the bridge with --allow-arbitrary-code, and "
+                "either set SD_MCP_ALLOW_EXECUTE_CODE=1 in SD's environment "
+                "or create an 'allow_execute_code' file in the plugin folder "
+                "({}).".format(
+                    os.path.dirname(os.path.abspath(__file__))))
         stdout_cap = io.StringIO()
         stderr_cap = io.StringIO()
         app_obj    = sd.getContext().getSDApplication()

@@ -115,6 +115,8 @@ LIB = {
     "flood_fill_to_grayscale":  "pkg:///flood_fill_to_grayscale?dependency=1323881949",
     # Tiling
     "tile_random":            "pkg:///tile_random?dependency=1508386588",
+    "brick_generator":        "pkg:///brick_generator?dependency=1299608969",
+    "tile_generator":         "pkg:///tile_generator?dependency=1584428127",
 }
 
 
@@ -640,43 +642,43 @@ def _concrete_recipe(description, color=(0.52, 0.50, 0.48), roughness=0.88, meta
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _brick_recipe(description, color=(0.58, 0.30, 0.18), roughness=0.85, metallic=0.0,
-                  brick_scale=4, mortar_width=0.08, disorder=0.3):
-    """Brick: polygon tiles → mortar gaps via levels → surface perlin texture.
-    Multi-pass: polygon base → slope-blur for mortar → warp + detail perlin → final blend.
+                  bricks=(4, 8), mortar_width=0.08, disorder=0.3):
+    """Brick: brick_generator running bond → mortar gaps via levels → surface perlin texture.
+    Multi-pass: brick_generator base → slope-blur for mortar → warp + detail perlin → final blend.
     """
+    gap = mortar_width * 0.5
     nodes = [
-        # Brick tile shape from polygon_2
-        {"id_alias": "br_poly",      "resource_url": LIB["polygon_2"],         "position": [-1600, 0],
-         "parameters": {"Tiling": {"value": brick_scale, "type": "int"}, "Sides": {"value": 4, "type": "int"},
-                        "Scale": {"value": 0.92, "type": "float"}, "Rotation": {"value": 0.0, "type": "float"},
-                        "Gradient": {"value": 1.0, "type": "float"}}},
-        # Stretch horizontally for brick aspect ratio (2:1)
-        {"id_alias": "br_stretch",   "definition_id": "sbs::compositing::transformation", "position": [-1400, 0],
-         "parameters": {"matrix22": [2.0, 0.0, 0.0, 1.0]}},
-        # Clamp to binary brick/mortar via levels
+        # Running bond brick shape (bricks = columns x rows; 4x8 gives 2:1 bricks)
+        {"id_alias": "br_bricks",    "resource_url": LIB["brick_generator"],   "position": [-1400, 0],
+         "parameters": {"Bricks": {"value": list(bricks), "type": "int2"},
+                        "Gap":    {"value": [gap, gap * 2.0], "type": "float2"},
+                        "Bevel":  {"value": [0.12, 0.25, 0.0, 0.0], "type": "float4"},
+                        "Height": {"value": [0.8, 1.0, 0.0, 0.0], "type": "float4"},
+                        "Offset": {"value": [0.5, 0.0], "type": "float2"}}},
+        # Bevelled bricks → firm brick/mortar split with a soft edge
         {"id_alias": "br_lvl_mortar","definition_id": "sbs::compositing::levels", "position": [-1200, 0],
-         "parameters": {"levelinlow": [mortar_width, mortar_width, mortar_width, mortar_width],
-                        "levelinhigh": [mortar_width + 0.1, mortar_width + 0.1, mortar_width + 0.1, mortar_width + 0.1],
+         "parameters": {"levelinlow": [0.02, 0.02, 0.02, 0.02],
+                        "levelinhigh": [0.6, 0.6, 0.6, 0.6],
                         "leveloutlow": [0.0, 0.0, 0.0, 0.0], "levelouthigh": [1.0, 1.0, 1.0, 1.0]}},
         # Slope-blur for mortar groove depth
         {"id_alias": "br_perlin_mb", "resource_url": LIB["perlin_noise"],      "position": [-1200, 200],
-         "parameters": {"scale": {"value": 24, "type": "int"}, "disorder": {"value": disorder * 0.3, "type": "float"}, "non_square_expansion": {"value": True, "type": "bool"}}},
+         "parameters": {"scale": {"value": 24, "type": "int"}, "disorder": {"value": disorder * 0.3, "type": "float"}}},
         {"id_alias": "br_blur_mb",   "resource_url": LIB["blur_hq_grayscale"], "position": [-1000, 200],
          "parameters": {"Intensity": {"value": 2.0, "type": "float"}, "Quality": {"value": 0, "type": "int"}}},
         {"id_alias": "br_slope1",    "resource_url": LIB["slope_blur_grayscale_2"], "position": [-1000, 0],
          "parameters": {"Samples": {"value": 8, "type": "int"}, "Intensity": {"value": 0.4, "type": "float"}, "mode": {"value": 7, "type": "int"}}},
         # Warp pass 1 — brick edge irregularity (hand-laid variation)
         {"id_alias": "br_perlin_w1", "resource_url": LIB["perlin_noise"],      "position": [-800, 300],
-         "parameters": {"scale": {"value": 8, "type": "int"}, "disorder": {"value": disorder * 0.5, "type": "float"}, "non_square_expansion": {"value": True, "type": "bool"}}},
+         "parameters": {"scale": {"value": 8, "type": "int"}, "disorder": {"value": disorder * 0.5, "type": "float"}}},
         {"id_alias": "br_blur_w1",   "resource_url": LIB["blur_hq_grayscale"], "position": [-600, 300],
          "parameters": {"Intensity": {"value": 3.0, "type": "float"}, "Quality": {"value": 0, "type": "int"}}},
         {"id_alias": "br_warp1",     "definition_id": "sbs::compositing::warp",   "position": [-800, 0],
          "parameters": {"intensity": disorder * 0.3}},
         # Surface detail — clouds for fired clay texture variation
-        {"id_alias": "br_clouds",    "resource_url": LIB["clouds_2"],          "position": [-600, 200],
-         "parameters": {"scale": {"value": 6, "type": "int"}, "disorder": {"value": disorder * 0.6, "type": "float"}, "non_square_expansion": {"value": True, "type": "bool"}}},
+        # (clouds_2 exposes no scale/disorder params in SD 15)
+        {"id_alias": "br_clouds",    "resource_url": LIB["clouds_2"],          "position": [-600, 200]},
         {"id_alias": "br_perlin_surf","resource_url": LIB["perlin_noise"],     "position": [-400, 200],
-         "parameters": {"scale": {"value": 16, "type": "int"}, "disorder": {"value": disorder, "type": "float"}, "non_square_expansion": {"value": True, "type": "bool"}}},
+         "parameters": {"scale": {"value": 16, "type": "int"}, "disorder": {"value": disorder, "type": "float"}}},
         # Blend surface textures together
         {"id_alias": "br_blend_surf","definition_id": "sbs::compositing::blend",   "position": [-400, 0],
          "parameters": {"blendingmode": 3, "opacitymult": 0.25}},
@@ -689,8 +691,7 @@ def _brick_recipe(description, color=(0.58, 0.30, 0.18), roughness=0.85, metalli
          "parameters": {"levelinlow": [0.05, 0.05, 0.05, 0.05], "levelinhigh": [0.95, 0.95, 0.95, 0.95]}},
     ]
     connections = [
-        {"from": "br_poly",       "to": "br_stretch",    "from_output": "output",             "to_input": "input1"},
-        {"from": "br_stretch",    "to": "br_lvl_mortar", "from_output": "unique_filter_output","to_input": "input1"},
+        {"from": "br_bricks",     "to": "br_lvl_mortar", "from_output": "Bricks_Generator",   "to_input": "input1"},
         {"from": "br_perlin_mb",  "to": "br_blur_mb",    "from_output": "output",             "to_input": "Source"},
         {"from": "br_lvl_mortar", "to": "br_slope1",     "from_output": "unique_filter_output","to_input": "Source"},
         {"from": "br_blur_mb",    "to": "br_slope1",     "from_output": "Blur_HQ",            "to_input": "Effect"},
@@ -1775,9 +1776,9 @@ _reg("concrete_aged",     _concrete_recipe("Aged concrete — weathered, more cr
 _reg("concrete_smooth",   _concrete_recipe("Smooth concrete — polished cast surface, minimal cracks", color=(0.60, 0.58, 0.56), roughness=0.70, crack_intensity=0.15, detail_scale=24, disorder=0.2))
 
 # BRICK
-_reg("brick_red",         _brick_recipe("Classic red brick — fired clay, rough mortar joints", color=(0.55, 0.28, 0.16), roughness=0.87, brick_scale=4, mortar_width=0.06, disorder=0.3))
-_reg("brick_old",         _brick_recipe("Old weathered brick — irregular, spalled edges", color=(0.45, 0.22, 0.12), roughness=0.92, brick_scale=3, mortar_width=0.09, disorder=0.55))
-_reg("brick_white",       _brick_recipe("White painted brick — thin coat on masonry", color=(0.88, 0.85, 0.82), roughness=0.78, brick_scale=4, mortar_width=0.05, disorder=0.2))
+_reg("brick_red",         _brick_recipe("Classic red brick — fired clay, rough mortar joints", color=(0.55, 0.28, 0.16), roughness=0.87, bricks=(4, 8), mortar_width=0.06, disorder=0.3))
+_reg("brick_old",         _brick_recipe("Old weathered brick — irregular, spalled edges", color=(0.45, 0.22, 0.12), roughness=0.92, bricks=(4, 8), mortar_width=0.08, disorder=0.55))
+_reg("brick_white",       _brick_recipe("White painted brick — thin coat on masonry", color=(0.88, 0.85, 0.82), roughness=0.78, bricks=(4, 8), mortar_width=0.05, disorder=0.2))
 
 # LAVA / VOLCANIC
 _reg("lava_fresh",        _lava_recipe("Fresh lava — active flow, glowing crack channels", color=(0.08, 0.04, 0.03), roughness=0.93))
