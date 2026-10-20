@@ -6,6 +6,30 @@ All notable changes to the Substance Designer MCP Plugin are documented here.
 
 ## [Unreleased]
 
+### Bridge (v2.5.0)
+- **Material runs**: a persistent, versioned iteration workflow built on the
+  existing tools. Runs, revisions, candidates, evaluations and artifacts live in
+  SQLite under `%LOCALAPPDATA%/sd_mcp/runs` (override with `--runs-dir` or
+  `SD_MCP_RUNS_DIR`). Every revision is an immutable package copy plus a graph
+  fingerprint, so a run can return to any recorded state.
+  - `start_material_run`, `get_material_run`, `list_material_runs`
+  - `checkpoint_material_revision` (baseline/extra checkpoints),
+    `verify_material_checkpoint`, `restore_material_revision`
+  - `propose_material_patch` (validated `set_parameter` / `set_output_size`
+    operations), `apply_material_patch` (re-validates, refuses on drift,
+    auto-checkpoints the applied state and rolls back on failure)
+  - `capture_material_preview` (multi-output contact sheet + 3D render and
+    per-channel stats in one call; returned as images when requested)
+  - `record_material_evaluation` (rejects stale/missing previews, compares
+    against the base revision, technical checks + regression threshold),
+    `decide_material_candidate`, `finish_material_run` (restores the best
+    accepted revision)
+  - The controller is Qt-free, serialises every SD operation on one lock and
+    resumes runs after a bridge restart.
+- Added `--runs-dir` for the material-run database and checkpoints.
+- `checkpoint_package`, `restore_package`, `verify_checkpoint` and
+  `graph_fingerprint` use the heavy timeout profile.
+
 ### Bridge (v2.4.0)
 - New `capture_node_preview` tool: captures each node's graph-editor tile with
   SD's live thumbnail for one node or a labeled contact sheet of `node_ids`
@@ -53,6 +77,23 @@ All notable changes to the Substance Designer MCP Plugin are documented here.
 - Version alignment: `server/pyproject.toml` was still `0.1.0` while the bridge
   logged v2.4.0; both are now `2.4.0`, with `BRIDGE_VERSION` as the single
   source of truth in the bridge code
+
+### Plugin (v3.9.0)
+- Material-run checkpoint commands:
+  - `checkpoint_package` saves an immutable package copy with
+    `SDPackageMgr.saveCopyOfPackageAs` (the working package path is unchanged),
+    creating parent directories; explains the save-first requirement for
+    never-saved packages.
+  - `verify_checkpoint` loads a checkpoint package, fingerprints the graph
+    inside it and unloads it again (skipping both when already loaded).
+  - `restore_package` unloads the working package, loads the checkpoint and
+    optionally saves it back over the working path; refuses to use the working
+    path or an already-loaded checkpoint as the source.
+  - `graph_fingerprint` returns a canonical JSON description of a graph: nodes
+    (ids, definitions, positions, output role, inputs with serialized values and
+    connection flags, annotations), the full connection list, graph inputs and
+    output node ids - used for drift detection and restore verification.
+- `PLUGIN_VERSION` is now 3.9.0; the bridge logs the loaded plugin version.
 
 ### Plugin (v3.8.0)
 - `capture_node_preview` command: grabs each node's graph-editor tile (which

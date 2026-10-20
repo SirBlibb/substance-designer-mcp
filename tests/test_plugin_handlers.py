@@ -631,3 +631,355 @@ def test_capture_node_preview_sheet_skips_failures(handler, monkeypatch, tmp_pat
         {"node": "n2", "label": "B", "reason": "no preview"}]
     assert seen["prefix"] == "node_preview_sheet"
     assert len(seen["tiles"]) == 1
+
+
+# ── Material-run checkpoint commands (plugin v3.9.0) ───────────────────────
+
+class _FakeValue:
+    def __init__(self, raw):
+        self.raw = raw
+
+    def get(self):
+        return self.raw
+
+
+class _FakeProp:
+    def __init__(self, prop_id):
+        self._id = prop_id
+
+    def getId(self):
+        return self._id
+
+
+class _FakeConn:
+    def __init__(self, node, prop):
+        self._node = node
+        self._prop = prop
+
+    def getInputPropertyNode(self):
+        return self._node
+
+    def getInputProperty(self):
+        return self._prop
+
+
+class _FakeList:
+    def __init__(self, items):
+        self._items = list(items)
+
+    def getSize(self):
+        return len(self._items)
+
+    def getItem(self, index):
+        return self._items[index]
+
+
+class _FakeNode:
+    def __init__(self, identifier, definition_id, inputs,
+                 annotations=None, sources=None, position=(10.0, 20.0)):
+        self._identifier = identifier
+        self._definition = definition_id
+        self._inputs = dict(inputs)
+        self._annotations = annotations or {}
+        self._sources = sources or {}
+        self._position = position
+
+    def getIdentifier(self):
+        return self._identifier
+
+    def getDefinition(self):
+        return types.SimpleNamespace(getId=lambda: self._definition)
+
+    def getPosition(self):
+        x, y = self._position
+        return types.SimpleNamespace(x=x, y=y)
+
+    def getProperties(self, category):
+        if category == "input":
+            return [_FakeProp(pid) for pid in self._inputs]
+        if category == "annotation":
+            return [_FakeProp(pid) for pid in self._annotations]
+        return []
+
+    def getPropertyValue(self, prop):
+        pid = prop.getId()
+        if pid in self._inputs:
+            return _FakeValue(self._inputs[pid])
+        return _FakeValue(self._annotations[pid])
+
+    def getPropertyConnections(self, prop):
+        source = self._sources.get(prop.getId())
+        if not source:
+            return None
+        node, output = source
+        return [_FakeConn(node, _FakeProp(output))]
+
+
+class _FakeGraph:
+    def __init__(self, identifier, nodes, output_ids=None, graph_inputs=None):
+        self._identifier = identifier
+        self._nodes = list(nodes)
+        self._outputs = list(output_ids or [])
+        self._graph_inputs = graph_inputs or {}
+
+    def getIdentifier(self):
+        return self._identifier
+
+    def getNodes(self):
+        return list(self._nodes)
+
+    def getOutputNodes(self):
+        by_id = {node.getIdentifier(): node for node in self._nodes}
+        return _FakeList([by_id[nid] for nid in self._outputs if nid in by_id])
+
+    def getProperties(self, category):
+        if category == "input":
+            return [_FakeProp(pid) for pid in self._graph_inputs]
+        return []
+
+    def getPropertyValue(self, prop):
+        return _FakeValue(self._graph_inputs[prop.getId()])
+
+
+class _FakePackage:
+    def __init__(self, file_path, graphs=None):
+        self._path = str(file_path) if file_path else ""
+        self._graphs = list(graphs or [])
+
+    def getFilePath(self):
+        return self._path
+
+    def getChildrenResources(self, recursive=False):
+        return list(self._graphs)
+
+
+class _FakePackageMgr:
+    def __init__(self, user_packages=None, all_packages=None):
+        self.user_packages = list(user_packages or [])
+        self.all_packages = list(
+            all_packages if all_packages is not None else self.user_packages)
+        self.calls = []
+        self.loaded = {}
+        self.copy_error = None
+
+    def getUserPackages(self):
+        return list(self.user_packages)
+
+    def getPackages(self):
+        return list(self.all_packages)
+
+    def saveCopyOfPackageAs(self, pkg, path):
+        self.calls.append(("save_copy", pkg, path))
+        if self.copy_error:
+            raise self.copy_error
+        Path(path).write_bytes(b"checkpoint package")
+
+    def loadUserPackage(self, path):
+        self.calls.append(("load", path))
+        package = self.loaded.get(path)
+        if package is None:
+            package = _FakePackage(path)
+        self.user_packages.append(package)
+        self.all_packages.append(package)
+        return package
+
+    def unloadUserPackage(self, pkg):
+        self.calls.append(("unload", pkg.getFilePath()))
+        if pkg in self.user_packages:
+            self.user_packages.remove(pkg)
+        if pkg in self.all_packages:
+            self.all_packages.remove(pkg)
+
+    def savePackageAs(self, pkg, path):
+        self.calls.append(("save_as", path))
+
+
+def _checkpoint_graph():
+    noise = _FakeNode(
+        "noise", "sbs::compositing::perlin_noise",
+        {"disorder": 0.5, "$randomseed": 1},
+        annotations={"$label": "Noise"})
+    blur = _FakeNode(
+        "blur", "sbs::compositing::blur",
+        {"intensity": 5.0, "input1": None},
+        sources={"input1": (noise, "unique_filter_output")})
+    return _FakeGraph("G", [noise, blur], output_ids=["blur"],
+                      graph_inputs={"$outputsize": types.SimpleNamespace(
+                          x=11, y=11)})
+
+
+def test_plugin_version_and_handlers_registered(plugin_module, handler):
+    assert plugin_module.PLUGIN_VERSION >= (3, 9, 0)
+    for name in ("graph_fingerprint", "checkpoint_package",
+                 "verify_checkpoint", "restore_package"):
+        assert handler.HANDLERS[name] == getattr(handler, name)
+
+
+def test_fingerprint_graph_captures_nodes_and_connections(handler):
+    fingerprint = handler._fingerprint_graph(_checkpoint_graph())
+
+    assert fingerprint["graph_identifier"] == "G"
+    assert [node["id"] for node in fingerprint["nodes"]] == ["noise", "blur"]
+    noise, blur = fingerprint["nodes"]
+    assert noise["definition"] == "sbs::compositing::perlin_noise"
+    assert noise["position"] == [10.0, 20.0]
+    assert noise["inputs"][0]["id"] == "disorder"
+    assert noise["inputs"][0]["value"] == "0.5"
+    assert noise["annotations"] == [{"id": "$label", "value": "Noise"}]
+    assert blur["inputs"][1]["connected"] is True
+    assert fingerprint["connections"] == [{
+        "from_node": "noise", "from_output": "unique_filter_output",
+        "to_node": "blur", "to_input": "input1"}]
+    assert fingerprint["graph_inputs"][0]["id"] == "$outputsize"
+    assert fingerprint["graph_inputs"][0]["value"] == {"x": 11, "y": 11}
+    assert fingerprint["output_node_ids"] == ["blur"]
+    assert blur["is_output"] is True
+
+
+def test_graph_fingerprint_command_resolves_graph(handler, monkeypatch):
+    monkeypatch.setattr(handler, "_resolve_graph",
+                        lambda gid: _checkpoint_graph())
+    assert handler.graph_fingerprint("G")["graph_identifier"] == "G"
+
+
+def test_checkpoint_package_saves_copy_and_fingerprint(handler, monkeypatch,
+                                                       tmp_path):
+    graph = _checkpoint_graph()
+    pkg = _FakePackage(tmp_path / "work.sbs", [graph])
+    mgr = _FakePackageMgr([pkg])
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+    monkeypatch.setattr(handler, "_resolve_package",
+                        lambda index=0, path=None: pkg)
+    monkeypatch.setattr(handler, "_resolve_graph", lambda gid: graph)
+    checkpoint = tmp_path / "revisions" / "r0001.sbs"
+
+    result = handler.checkpoint_package(
+        checkpoint_path=str(checkpoint), graph_identifier="G")
+
+    assert checkpoint.is_file()
+    assert result["checkpoint_path"] == str(checkpoint)
+    assert result["package_path"] == str(tmp_path / "work.sbs")
+    assert result["size"] == len(b"checkpoint package")
+    assert result["fingerprint"]["graph_identifier"] == "G"
+    assert mgr.calls == [("save_copy", pkg, str(checkpoint))]
+
+
+def test_checkpoint_package_refuses_working_path(handler, monkeypatch, tmp_path):
+    pkg = _FakePackage(tmp_path / "work.sbs")
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: _FakePackageMgr([pkg]))
+    monkeypatch.setattr(handler, "_resolve_package",
+                        lambda index=0, path=None: pkg)
+
+    with pytest.raises(ValueError, match="must differ"):
+        handler.checkpoint_package(checkpoint_path=str(tmp_path / "work.sbs"))
+
+
+def test_checkpoint_package_requires_saved_package(handler, monkeypatch, tmp_path):
+    unsaved = _FakePackage("")
+    mgr = _FakePackageMgr([unsaved])
+    mgr.copy_error = RuntimeError("not saved")
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+    monkeypatch.setattr(handler, "_resolve_package",
+                        lambda index=0, path=None: unsaved)
+
+    with pytest.raises(RuntimeError, match="Save the package first"):
+        handler.checkpoint_package(checkpoint_path=str(tmp_path / "r.sbs"))
+
+
+def test_verify_checkpoint_loads_and_unloads(handler, monkeypatch, tmp_path):
+    checkpoint = tmp_path / "r0001.sbs"
+    checkpoint.write_bytes(b"data")
+    graph = _checkpoint_graph()
+    loaded = _FakePackage(checkpoint, [graph])
+    mgr = _FakePackageMgr(all_packages=[])
+    mgr.loaded[str(checkpoint)] = loaded
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+
+    result = handler.verify_checkpoint(str(checkpoint), "G")
+
+    assert result["fingerprint"]["graph_identifier"] == "G"
+    assert result["already_loaded"] is False
+    assert mgr.calls == [("load", str(checkpoint)),
+                         ("unload", str(checkpoint))]
+
+
+def test_verify_checkpoint_missing_graph_still_unloads(handler, monkeypatch,
+                                                       tmp_path):
+    checkpoint = tmp_path / "r0001.sbs"
+    checkpoint.write_bytes(b"data")
+    loaded = _FakePackage(checkpoint, [])
+    mgr = _FakePackageMgr(all_packages=[])
+    mgr.loaded[str(checkpoint)] = loaded
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+
+    with pytest.raises(RuntimeError, match="does not contain graph 'G'"):
+        handler.verify_checkpoint(str(checkpoint), "G")
+
+    assert mgr.calls[-1] == ("unload", str(checkpoint))
+
+
+def test_verify_checkpoint_skips_unload_when_already_loaded(handler, monkeypatch,
+                                                            tmp_path):
+    checkpoint = tmp_path / "r0001.sbs"
+    checkpoint.write_bytes(b"data")
+    pkg = _FakePackage(checkpoint, [_checkpoint_graph()])
+    mgr = _FakePackageMgr(all_packages=[pkg])
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+
+    result = handler.verify_checkpoint(str(checkpoint), "G")
+
+    assert result["already_loaded"] is True
+    assert mgr.calls == []
+
+
+def test_restore_package_unloads_loads_and_saves_back(handler, monkeypatch,
+                                                      tmp_path):
+    working = _FakePackage(tmp_path / "work.sbs")
+    checkpoint = tmp_path / "r0001.sbs"
+    checkpoint.write_bytes(b"data")
+    restored = _FakePackage(checkpoint, [_checkpoint_graph()])
+    mgr = _FakePackageMgr([working])
+    mgr.loaded[str(checkpoint)] = restored
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+    monkeypatch.setattr(handler, "_resolve_package",
+                        lambda index=0, path=None: working)
+
+    result = handler.restore_package(str(checkpoint), graph_identifier="G")
+
+    assert [call[0] for call in mgr.calls] == ["unload", "load", "save_as"]
+    assert mgr.calls[0][1] == str(tmp_path / "work.sbs")
+    assert mgr.calls[1][1] == str(checkpoint)
+    assert mgr.calls[2][1] == str(tmp_path / "work.sbs")
+    assert result["restored_from"] == str(checkpoint)
+    assert result["restored_to"] == str(tmp_path / "work.sbs")
+    assert result["fingerprint"]["graph_identifier"] == "G"
+
+
+def test_restore_package_without_save_back(handler, monkeypatch, tmp_path):
+    working = _FakePackage(tmp_path / "work.sbs")
+    checkpoint = tmp_path / "r0001.sbs"
+    checkpoint.write_bytes(b"data")
+    mgr = _FakePackageMgr([working])
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+    monkeypatch.setattr(handler, "_resolve_package",
+                        lambda index=0, path=None: working)
+
+    result = handler.restore_package(str(checkpoint), save_back=False)
+
+    assert [call[0] for call in mgr.calls] == ["unload", "load"]
+    assert result["restored_to"] == str(checkpoint)
+
+
+def test_restore_package_refuses_loaded_checkpoint(handler, monkeypatch,
+                                                   tmp_path):
+    working = _FakePackage(tmp_path / "work.sbs")
+    checkpoint = tmp_path / "r0001.sbs"
+    checkpoint.write_bytes(b"data")
+    loaded = _FakePackage(checkpoint)
+    mgr = _FakePackageMgr([working, loaded])
+    monkeypatch.setattr(handler, "_pkg_mgr", lambda: mgr)
+    monkeypatch.setattr(handler, "_resolve_package",
+                        lambda index=0, path=None: working)
+
+    with pytest.raises(ValueError, match="already loaded"):
+        handler.restore_package(str(checkpoint))

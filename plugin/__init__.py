@@ -1,5 +1,5 @@
 """
-Substance Designer MCP Plugin v3.8.0
+Substance Designer MCP Plugin v3.9.0
 =====================================
 ARCHITECTURE
 ============
@@ -70,11 +70,20 @@ VERSION HISTORY
           from the graph view without a graph.compute(); single node or a
           labeled multi-node contact sheet, using a graph-view crop (or a
           graph-owned preview widget when the SD version exposes one).
-          RELIABILITY: one worker per client so job polls and cancels are not
-          queued behind computes; command dispatch waits are bounded below the
-          bridge timeout, timed-out queued calls are cancelled, request ids
-          replay cached responses, SD_MCP_PORT selects the plugin port, and
-          non-finite floats are replaced with explicit flags.
+           RELIABILITY: one worker per client so job polls and cancels are not
+           queued behind computes; command dispatch waits are bounded below the
+           bridge timeout, timed-out queued calls are cancelled, request ids
+           replay cached responses, SD_MCP_PORT selects the plugin port, and
+           non-finite floats are replaced with explicit flags.
+  3.9.0 - MATERIAL RUN CHECKPOINTS (used by the bridge's material-run
+          workflow): checkpoint_package saves an immutable copy of a package
+          via SDPackageMgr.saveCopyOfPackageAs without changing the working
+          package; verify_checkpoint loads a checkpoint package, fingerprints
+          the graph inside it and unloads it again; restore_package unloads
+          the working package, loads the checkpoint and (optionally) saves it
+          back over the working path; graph_fingerprint returns a canonical
+          JSON description of a graph (nodes, properties, connections, graph
+          inputs) for drift detection and restore verification.
 """
 
 import sd
@@ -137,7 +146,7 @@ def _parse_ports(raw):
 
 
 DEFAULT_PORTS     = _parse_ports(os.environ.get("SD_MCP_PORT")) or [9881]
-PLUGIN_VERSION    = (3, 8, 0)
+PLUGIN_VERSION    = (3, 9, 0)
 HEADER_SIZE       = 4
 COMMAND_TIMEOUT   = _env_int("SD_MCP_COMMAND_TIMEOUT", 120)
 COMMAND_TIMEOUT_MAX = _env_int("SD_MCP_COMMAND_TIMEOUT_MAX", 600)
@@ -1071,6 +1080,11 @@ class CommandHandler:
             "job_cancel":             self.job_cancel,
             "send_to_3d_view":        self.send_to_3d_view,
             "send_to_3d_view_status": self.send_to_3d_view_status,
+            # ── Material-run checkpoints ──
+            "graph_fingerprint":      self.graph_fingerprint,
+            "checkpoint_package":     self.checkpoint_package,
+            "verify_checkpoint":      self.verify_checkpoint,
+            "restore_package":        self.restore_package,
             # ── Documentation ──
             "list_documentation":     self.list_documentation,
             # ── Development ──
@@ -1825,6 +1839,322 @@ class CommandHandler:
             except Exception:
                 pass
         return snapshot
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # ── MATERIAL-RUN CHECKPOINTS ────────────────────────────────────────
+    # ═══════════════════════════════════════════════════════════════════════
+    # These commands support the bridge's versioned material-iteration
+    # workflow. A checkpoint is an *immutable copy* of the whole package on
+    # disk; restore unloads the working package, loads the checkpoint and
+    # optionally saves it back over the working path. The checkpoint file is
+    # never modified, and a graph fingerprint (canonical node/property/
+    # connection description) lets the bridge verify restores and detect
+    # drift in the working graph.
+
+    def _find_graph_in_package(self, pkg, identifier):
+        try:
+            for res in list(pkg.getChildrenResources(False)):
+                try:
+                    if res.getIdentifier() == identifier:
+                        return res
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def _fingerprint_graph(self, graph):
+        """Canonical, JSON-safe description of a comp graph.
+
+        Node ids are included so the bridge can report id drift, but its
+        id-independent structure hash is what restore verification compares.
+        Input/annotation values are serialized with the same converter used
+        by get_node_info, so fingerprints are stable across calls.
+        """
+        output_ids = set()
+        try:
+            arr = graph.getOutputNodes()
+            for i in range(arr.getSize()):
+                try:
+                    output_ids.add(arr.getItem(i).getIdentifier())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        nodes = list(graph.getNodes())
+        node_entries = []
+        for node in nodes:
+            try:
+                nid = node.getIdentifier()
+            except Exception:
+                continue
+            entry = {
+                "id": nid,
+                "definition": self._get_node_def_id(node),
+                "position": self._get_node_pos(node),
+                "is_output": nid in output_ids,
+                "is_library": self._is_instance_node(node),
+                "inputs": [],
+                "annotations": [],
+            }
+            try:
+                for prop in list(node.getProperties(SDPropertyCategory.Input)):
+                    pid = prop.getId()
+                    info = {"id": pid}
+                    try:
+                        val = node.getPropertyValue(prop)
+                        if val is not None:
+                            info["value"] = self._serialize_sd_value(val)
+                    except Exception:
+                        pass
+                    try:
+                        conns = node.getPropertyConnections(prop)
+                        info["connected"] = bool(conns is not None and list(conns))
+                    except Exception:
+                        pass
+                    entry["inputs"].append(info)
+            except Exception:
+                pass
+            try:
+                for prop in list(node.getProperties(SDPropertyCategory.Annotation)):
+                    pid = prop.getId()
+                    info = {"id": pid}
+                    try:
+                        val = node.getPropertyValue(prop)
+                        if val is not None:
+                            info["value"] = self._serialize_sd_value(val)
+                    except Exception:
+                        pass
+                    entry["annotations"].append(info)
+            except Exception:
+                pass
+            node_entries.append(entry)
+
+        connections = []
+        for node in nodes:
+            try:
+                nid = node.getIdentifier()
+            except Exception:
+                continue
+            try:
+                for prop in list(node.getProperties(SDPropertyCategory.Input)):
+                    pid = prop.getId()
+                    conns = node.getPropertyConnections(prop)
+                    if conns is None:
+                        continue
+                    for conn in list(conns):
+                        try:
+                            sn = conn.getInputPropertyNode()
+                            sp = conn.getInputProperty()
+                            if sn and sp:
+                                connections.append({
+                                    "from_node": sn.getIdentifier(),
+                                    "from_output": sp.getId(),
+                                    "to_node": nid,
+                                    "to_input": pid,
+                                })
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        graph_inputs = []
+        try:
+            for prop in list(graph.getProperties(SDPropertyCategory.Input)):
+                pid = prop.getId()
+                info = {"id": pid}
+                try:
+                    val = graph.getPropertyValue(prop)
+                    if val is not None:
+                        info["value"] = self._serialize_sd_value(val)
+                except Exception:
+                    pass
+                graph_inputs.append(info)
+        except Exception:
+            pass
+
+        return {
+            "graph_identifier": graph.getIdentifier(),
+            "nodes": node_entries,
+            "connections": connections,
+            "graph_inputs": graph_inputs,
+            "output_node_ids": sorted(output_ids),
+        }
+
+    def graph_fingerprint(self, graph_identifier=None):
+        """Return a canonical JSON fingerprint of a graph (no compute).
+
+        Used by the bridge's material-run workflow for drift detection, and
+        by checkpoint verification to prove a saved copy matches the working
+        graph. Includes node ids, definitions, positions, property values,
+        connection list and graph inputs.
+        """
+        graph = self._resolve_graph(graph_identifier)
+        return self._fingerprint_graph(graph)
+
+    def checkpoint_package(self, package_index=0, package_path=None,
+                           checkpoint_path=None, graph_identifier=None):
+        """Save an immutable copy of a user package to `checkpoint_path`.
+
+        SDPackageMgr.saveCopyOfPackageAs writes the copy without changing
+        the working package's own file path, so the working session is
+        untouched. Pass graph_identifier to also embed a fingerprint of that
+        graph (computed before the copy) in the response.
+
+        The package must have been saved at least once; a never-saved
+        untitled package cannot be copied (save it first with save_package).
+        """
+        if not checkpoint_path:
+            raise ValueError("checkpoint_path is required.")
+        checkpoint_path = os.path.abspath(checkpoint_path)
+        pkg = self._resolve_package(package_index, package_path)
+        working_path = pkg.getFilePath()
+        if working_path and os.path.normcase(os.path.abspath(working_path)) == \
+                os.path.normcase(checkpoint_path):
+            raise ValueError(
+                "checkpoint_path must differ from the working package path "
+                "('{}').".format(working_path))
+        parent = os.path.dirname(checkpoint_path)
+        if parent and not os.path.exists(parent):
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except Exception as e:
+                raise ValueError("Cannot create checkpoint directory '{}': "
+                                 "{}".format(parent, e))
+
+        fingerprint = None
+        if graph_identifier:
+            graph = self._resolve_graph(graph_identifier)
+            fingerprint = self._fingerprint_graph(graph)
+
+        try:
+            self._pkg_mgr().saveCopyOfPackageAs(pkg, checkpoint_path)
+        except Exception as e:
+            if not working_path:
+                raise RuntimeError(
+                    "Could not copy an unsaved package to '{}'. Save the "
+                    "package first with save_package. ({})".format(
+                        checkpoint_path, e))
+            raise
+        if not os.path.isfile(checkpoint_path):
+            raise RuntimeError(
+                "saveCopyOfPackageAs reported success but '{}' does not "
+                "exist.".format(checkpoint_path))
+
+        return {
+            "checkpoint_path": checkpoint_path,
+            "package_path": working_path,
+            "graph_identifier": graph_identifier,
+            "fingerprint": fingerprint,
+            "size": os.path.getsize(checkpoint_path),
+        }
+
+    def verify_checkpoint(self, checkpoint_path, graph_identifier):
+        """Load a checkpoint package, fingerprint a graph inside it, unload.
+
+        The checkpoint file is loaded read-only as a temporary user package
+        (unloaded again afterwards, unless it was already loaded), so the
+        bridge can prove that a checkpoint file really contains the expected
+        graph state before relying on it for restore.
+        """
+        if not graph_identifier:
+            raise ValueError("graph_identifier is required.")
+        cp = os.path.abspath(checkpoint_path)
+        if not os.path.isfile(cp):
+            raise ValueError("Checkpoint file not found: '{}'".format(cp))
+        mgr = self._pkg_mgr()
+        already = None
+        for pkg in list(mgr.getPackages()):
+            try:
+                fp = pkg.getFilePath()
+            except Exception:
+                continue
+            if fp and os.path.normcase(os.path.abspath(fp)) == os.path.normcase(cp):
+                already = pkg
+                break
+        loaded = already if already is not None else mgr.loadUserPackage(cp)
+        try:
+            graph = self._find_graph_in_package(loaded, graph_identifier)
+            if graph is None:
+                raise RuntimeError(
+                    "The checkpoint '{}' does not contain graph '{}'.".format(
+                        cp, graph_identifier))
+            fingerprint = self._fingerprint_graph(graph)
+        finally:
+            if already is None:
+                try:
+                    mgr.unloadUserPackage(loaded)
+                except Exception:
+                    pass
+        return {
+            "checkpoint_path": cp,
+            "graph_identifier": graph_identifier,
+            "fingerprint": fingerprint,
+            "already_loaded": already is not None,
+        }
+
+    def restore_package(self, checkpoint_path, package_index=0,
+                        package_path=None, save_back=True,
+                        graph_identifier=None):
+        """Restore the working package from a checkpoint file.
+
+        Unloads the current working user package, loads the checkpoint as a
+        new user package and, when the working package had a file path and
+        save_back is True, saves the loaded checkpoint back over that path.
+        The checkpoint file itself is never modified. Unsaved changes in the
+        working package are discarded; the bridge's material-run controller
+        verifies fingerprints before calling this, so use it directly only
+        when the working state is disposable.
+        """
+        mgr = self._pkg_mgr()
+        cp = os.path.abspath(checkpoint_path)
+        if not os.path.isfile(cp):
+            raise ValueError("Checkpoint file not found: '{}'".format(cp))
+        working = self._resolve_package(package_index, package_path)
+        working_path = working.getFilePath()
+        if working_path and os.path.normcase(os.path.abspath(working_path)) == \
+                os.path.normcase(cp):
+            raise ValueError(
+                "checkpoint_path is the working package path; refusing to "
+                "restore a package from itself.")
+        for pkg in list(mgr.getUserPackages()):
+            try:
+                fp = pkg.getFilePath()
+            except Exception:
+                continue
+            if fp and os.path.normcase(os.path.abspath(fp)) == os.path.normcase(cp):
+                raise ValueError(
+                    "The checkpoint '{}' is already loaded as a package; "
+                    "unload it in SD before restoring.".format(cp))
+
+        try:
+            mgr.unloadUserPackage(working)
+        except Exception as e:
+            raise RuntimeError(
+                "Could not unload the working package ({}). If SD is showing "
+                "a save prompt, resolve it manually and retry. ({})".format(
+                    working_path or "<untitled>", e))
+        loaded = mgr.loadUserPackage(cp)
+        restored_to = cp
+        if save_back and working_path:
+            mgr.savePackageAs(loaded, working_path)
+            restored_to = working_path
+        fingerprint = None
+        if graph_identifier:
+            graph = self._find_graph_in_package(loaded, graph_identifier)
+            if graph is None:
+                raise RuntimeError(
+                    "The restored package does not contain graph "
+                    "'{}'.".format(graph_identifier))
+            fingerprint = self._fingerprint_graph(graph)
+        return {
+            "restored_from": cp,
+            "restored_to": restored_to,
+            "package_path": loaded.getFilePath(),
+            "graph_identifier": graph_identifier,
+            "fingerprint": fingerprint,
+        }
 
     # ═══════════════════════════════════════════════════════════════════════
     # ── 3D VIEW CAPTURE ─────────────────────────────────────────────────

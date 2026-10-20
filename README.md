@@ -10,7 +10,7 @@ Control Substance Designer from any MCP-compatible AI client (Claude Code, Claud
 
 - **Natural language → SD graph**: "Create a cracked concrete material" → 44-node PBR graph with height, normal, roughness, AO, baseColor, metallic outputs
 - **79 built-in material recipes**: pro-grade materials using the same node architecture as professional SD artists
-- **42 MCP tools**: get scene info, create/delete graphs, create nodes, connect nodes, set parameters, build full materials in one call, health check, snapshot, and stage-tracked cancellable long jobs
+- **55 MCP tools**: get scene info, create/delete graphs, create nodes, connect nodes, set parameters, build full materials in one call, health check, snapshot, stage-tracked cancellable long jobs, and versioned material runs with package checkpoints and rollback
 - **Library node support**: Clouds, Cells, Perlin Noise, Polygon, Edge Detect, Flood Fill, Multi-Directional Warp, etc.
 - **Thread-safe**: All SD API calls dispatched to Qt main thread via Signal/Slot queued connection
 
@@ -176,6 +176,45 @@ List all available material recipes
 | **`list_recipes`** | **List all 79 available material recipes** |
 | **`get_recipe_info`** | **Get details about a specific recipe** |
 | **`apply_recipe`** | **Apply a recipe to an existing graph** |
+| `start_material_run` | Start a versioned iteration run (goal, budget, preview preset) |
+| `get_material_run` / `list_material_runs` | Read run state, revisions, candidates, evaluations and artifacts |
+| `checkpoint_material_revision` | Save + verify an immutable package checkpoint as a revision |
+| `verify_material_checkpoint` | Reload a checkpoint and compare its graph fingerprint |
+| `restore_material_revision` | Restore the working package from a checkpointed revision |
+| `propose_material_patch` | Validate a `set_parameter` / `set_output_size` patch without editing |
+| `apply_material_patch` | Apply the patch, auto-checkpoint it, roll back on failure |
+| `capture_material_preview` | Contact sheet + 3D render + stats for the current revision |
+| `record_material_evaluation` | Record verdict/score; rejects stale previews, checks regressions |
+| `decide_material_candidate` | Accept the applied revision or restore the pre-patch baseline |
+| `finish_material_run` | Close the run and restore the best accepted revision |
+
+### Material Runs (versioned iteration)
+
+A material run turns free-form parameter edits into a reproducible loop. Each
+revision is a full package copy saved next to a SQLite database
+(`%LOCALAPPDATA%/sd_mcp/runs` by default; override with `--runs-dir` or
+`SD_MCP_RUNS_DIR`), so every step can be verified and rolled back.
+
+```
+start_material_run(graph_identifier="MyMaterial", goal="deeper cavity")
+checkpoint_material_revision()            # baseline; verified by reloading the copy
+propose_material_patch(operations=[
+    {"op": "set_parameter", "node_id": "Blur", "parameter_id": "intensity", "value": 12.0}])
+apply_material_patch()                    # applies + auto-checkpoints the result
+capture_material_preview()                # images + per-channel stats for review
+record_material_evaluation(verdict="better", accepted=True)
+decide_material_candidate()               # accept, or restore the base revision
+finish_material_run()                     # close, restoring the best accepted revision
+```
+
+Invalid patches, graph drift (manual edits since the checkpoint), stale previews
+and patch failures without a working rollback are rejected with explicit errors.
+`restore_material_revision` can return to any recorded revision later.
+
+Checkpoints and restores need plugin v3.9.0, so restart Substance Designer after
+updating. The opt-in `tests/test_material_live.py` exercises the whole workflow
+(including a real restore) against a scratch package; run it once after the
+restart to confirm the live path on your SD build.
 
 ### Material Recipes
 
@@ -286,7 +325,11 @@ first:
 
 - `--timeout` (default 150 s) applies to ordinary commands;
   `--heavy-timeout` (default 300 s) applies to builds, computes, captures,
-  `execute_code` and `save_package`.
+  `execute_code`, `save_package` and the material-run checkpoint/restore/
+  fingerprint commands.
+- `--runs-dir` (or `SD_MCP_RUNS_DIR`) selects where material runs store their
+  SQLite database and revision checkpoints (default
+  `%LOCALAPPDATA%\sd_mcp\runs`).
 - Each command carries its timeout to the plugin, which waits slightly less
   (`SD_MCP_COMMAND_TIMEOUT`, default 120, capped at 600 by
   `SD_MCP_COMMAND_TIMEOUT_MAX`) and cancels queued work when it expires.

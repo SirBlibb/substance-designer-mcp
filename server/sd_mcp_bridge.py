@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-sd_mcp_bridge.py - Substance Designer MCP Bridge v2.4.0
+sd_mcp_bridge.py - Substance Designer MCP Bridge v2.5.0
 
 Relay between Claude (stdio/FastMCP) and the SD plugin (TCP).
 
@@ -8,6 +8,20 @@ Architecture: Claude -> stdio -> this bridge -> TCP localhost:<port> -> SD plugi
 
 Protocol: Length-prefix framing [4-byte big-endian length][JSON payload]
 Connection: Fresh TCP socket per command (no persistent connection)
+
+Added in v2.5.0:
+  Material runs: a versioned, checkpoint-based iteration workflow on top of the
+  existing tools. Runs and revisions are persisted in SQLite (default
+  %LOCALAPPDATA%/sd_mcp/runs, override with --runs-dir or SD_MCP_RUNS_DIR);
+  each revision is an immutable package copy saved via saveCopyOfPackageAs and
+  verified by reloading it. New tools: start_material_run, get_material_run,
+  list_material_runs, checkpoint_material_revision, verify_material_checkpoint,
+  restore_material_revision, propose_material_patch, apply_material_patch,
+  capture_material_preview (contact sheet + 3D render images), and
+  record_material_evaluation, decide_material_candidate, finish_material_run.
+  The plugin gained checkpoint_package, restore_package, verify_checkpoint and
+  graph_fingerprint (plugin v3.9.0). The controller is independent of Qt and
+  runs every SD operation through the same one-at-a-time TCP transport.
 
 Added in v2.4.0:
   capture_node_preview: grabs each node's graph-editor tile (with SD's live
@@ -88,6 +102,8 @@ from mcp.types import ToolAnnotations
 from pydantic import (AliasChoices, BaseModel, ConfigDict, Field, ValidationError,
                       model_validator)
 
+import sd_material_runs
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -99,7 +115,7 @@ logger = logging.getLogger("SD_MCP_Bridge")
 # ---------------------------------------------------------------------------
 # Single source of truth for the bridge version; kept in sync with the
 # `version` field in server/pyproject.toml.
-BRIDGE_VERSION = "2.4.0"
+BRIDGE_VERSION = "2.5.0"
 
 # The bridge must outwait the plugin's main-thread dispatch budget (120 s by
 # default); the plugin additionally stops RESPONSE_GRACE seconds earlier.
@@ -117,6 +133,8 @@ _HEAVY_TOOLS = frozenset({
     "apply_recipe", "inspect_outputs", "get_map_stats", "capture_2d_view",
     "capture_node_preview", "capture_3d_view", "send_to_3d_view",
     "execute_code", "save_package",
+    "checkpoint_package", "restore_package", "verify_checkpoint",
+    "graph_fingerprint",
 })
 
 
@@ -152,6 +170,63 @@ _allow_dev_tools: bool = False
 # Shared secret: when set, every command carries a "token" field. The plugin
 # rejects commands while SD_MCP_TOKEN is set and the token does not match.
 _auth_token: Optional[str] = None
+
+# ── Material runs ───────────────────────────────────────────────────────────
+# Runs database + revision checkpoints. Defaults to %LOCALAPPDATA%/sd_mcp/runs;
+# override with --runs-dir or SD_MCP_RUNS_DIR. The controller is created
+# lazily on first use so unrelated tool calls do not touch the filesystem.
+_runs_dir: Optional[str] = None
+_material_controller: Optional["sd_material_runs.MaterialRunController"] = None
+_material_lock = threading.Lock()
+
+
+def _default_runs_dir() -> str:
+    env = os.environ.get("SD_MCP_RUNS_DIR", "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
+        "~/.local/share")
+    return os.path.join(base, "sd_mcp", "runs")
+
+
+def _material_designer(cmd_type: str, params: dict) -> Any:
+    """Designer callable for the run controller: one TCP command to the plugin."""
+    return _request(cmd_type, params)
+
+
+def _material_runs() -> "sd_material_runs.MaterialRunController":
+    global _material_controller
+    with _material_lock:
+        if _material_controller is None:
+            runs_dir = _runs_dir or _default_runs_dir()
+            store = sd_material_runs.MaterialRunStore(
+                os.path.join(runs_dir, "runs.sqlite3"))
+            _material_controller = sd_material_runs.MaterialRunController(
+                store=store, designer=_material_designer, runs_dir=runs_dir)
+            logger.info(f"Material runs: {runs_dir}")
+        return _material_controller
+
+
+def _reset_material_runs() -> None:
+    """Drop the cached controller (tests, or after changing the runs dir)."""
+    global _material_controller
+    with _material_lock:
+        _material_controller = None
+
+
+async def _material_op(fn, *args, **kwargs) -> dict:
+    """Run a controller method off the event loop; surface errors as ToolError."""
+    def work():
+        try:
+            return fn(*args, **kwargs)
+        except (sd_material_runs.RunError,
+                sd_material_runs.DesignerError) as exc:
+            raise ToolError(str(exc))
+    return await asyncio.to_thread(work)
+
+
+def _material_json(result: dict) -> str:
+    return json.dumps(result, indent=2)
 
 
 
@@ -352,6 +427,15 @@ Recommended workflow:
    properties in one call) or set_parameter, then capture again
    (refresh_first=True if the render looks stale).
 5. Changes are in memory until save_package is called.
+
+For a reproducible iteration loop, use the material-run tools:
+start_material_run -> checkpoint_material_revision (baseline; verifies the
+package copy) -> propose_material_patch -> apply_material_patch ->
+capture_material_preview (review the images/stats) ->
+record_material_evaluation -> decide_material_candidate (accept or restore the
+base), then repeat. finish_material_run restores the best accepted revision and
+closes the run. restore_material_revision returns to any checkpointed revision;
+verify_material_checkpoint proves a checkpoint file still matches.
 
 When a build fails, retry with preflight=True on create_batch_graph first; for
 already-created partial graphs prefer cleanup_on_failure=True next time.
@@ -1697,6 +1781,304 @@ async def graph_snapshot(ctx: Context,
 
 
 # ---------------------------------------------------------------------------
+# Material runs: versioned iteration with authoritative package checkpoints.
+# A run targets one graph; every revision stores an immutable package copy plus
+# a graph fingerprint. Patches are proposed, applied (with automatic
+# checkpoint), evaluated from a fresh preview, then accepted or rolled back.
+# ---------------------------------------------------------------------------
+
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+async def start_material_run(ctx: Context,
+                             graph_identifier: str,
+                             goal: str = "",
+                             max_iterations: int = 8,
+                             preview_preset: Optional[Dict[str, Any]] = None,
+                             constraints: Optional[List[str]] = None,
+                             seeds: Optional[Dict[str, Any]] = None,
+                             package_index: int = 0,
+                             package_path: Optional[str] = None) -> str:
+    """
+    Start a versioned material-iteration run for one graph.
+
+    Creates a persistent run record (SQLite, under the runs directory) and
+    returns its run_id. The graph is NOT saved or snapshotted yet: call
+    checkpoint_material_revision to record the baseline (and to verify that the
+    package can actually be copied/restored) before proposing patches.
+
+    - graph_identifier: graph name as shown in the Explorer
+    - goal: free-text objective, kept with the run for evaluation context
+    - max_iterations: patch budget (each accepted or rejected patch counts)
+    - preview_preset: defaults for capture_material_preview, keys:
+      output_usages (list), max_size (int), histogram_bins (int),
+      include_3d (bool), wait_ms (int), refresh_first (bool),
+      send_timeout_s (float, 3D-view binding wait)
+    - constraints: free-text constraints for the evaluator
+    - seeds: optional reproducibility data (e.g. random seeds) kept with the run
+    - package_index / package_path: which loaded user package holds the graph
+    """
+    runs = _material_runs()
+    result = await _material_op(runs.start_run, graph_identifier,
+                                goal=goal, max_iterations=max_iterations,
+                                preview_preset=preview_preset,
+                                constraints=constraints, seeds=seeds,
+                                package_index=package_index,
+                                package_path=package_path)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def get_material_run(ctx: Context,
+                           run_id: Optional[str] = None,
+                           include_artifacts: bool = True) -> str:
+    """
+    Get a run's state: goal, revision/candidate state, iteration budget,
+    revisions, candidates, evaluations and artifacts (paths, hashes, trimmed
+    stats). Omit run_id for the most recently updated run.
+    """
+    result = await _material_op(_material_runs().get_run, run_id,
+                                include_artifacts=include_artifacts)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def list_material_runs(ctx: Context, limit: int = 20) -> str:
+    """
+    List recent material runs (newest first): run_id, graph, state, iteration
+    progress, current/best revision and timestamps. Omit run_id in the other
+    material tools to target the most recently updated run.
+    """
+    result = await _material_op(_material_runs().list_runs, limit=limit)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+async def checkpoint_material_revision(ctx: Context,
+                                       run_id: Optional[str] = None,
+                                       label: Optional[str] = None,
+                                       checkpoint_path: Optional[str] = None,
+                                       verify: bool = True,
+                                       notes: Optional[str] = None) -> str:
+    """
+    Save an immutable package checkpoint for the current working graph and
+    record it as a new revision.
+
+    Saves a full package copy via saveCopyOfPackageAs (the working package's
+    own path is unchanged), records its fingerprint and sha256, and - when
+    verify is True - reloads the checkpoint in SD and compares the graph
+    structure hash, proving the copy really contains the current graph. The
+    checkpoint path defaults to <runs>/<run_id>/revisions/rNNNN.sbs.
+
+    Use this for the baseline before the first patch, and after manual edits
+    you want to keep. Fails if a candidate is pending.
+    """
+    result = await _material_op(_material_runs().checkpoint_revision, run_id,
+                                label=label, checkpoint_path=checkpoint_path,
+                                verify=verify, notes=notes)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def verify_material_checkpoint(ctx: Context,
+                                     run_id: Optional[str] = None,
+                                     revision_id: Optional[str] = None) -> str:
+    """
+    Re-verify a recorded revision: reload its checkpoint file in SD, compare
+    the graph structure fingerprint with the stored one, and update the
+    revision's verified flag. Omit revision_id for the run's current revision.
+
+    Returns verified + both structure hashes. A False result means the
+    checkpoint file was altered or contains a different graph.
+    """
+    result = await _material_op(_material_runs().verify_checkpoint, run_id,
+                                revision_id=revision_id)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_DESTRUCTIVE, structured_output=False)
+async def restore_material_revision(ctx: Context,
+                                    run_id: Optional[str] = None,
+                                    revision_id: Optional[str] = None,
+                                    save_back: bool = True,
+                                    force: bool = False) -> str:
+    """
+    Restore the working package from a revision checkpoint.
+
+    Unloads the working package, loads the checkpoint and (with save_back)
+    saves it back over the working package path, so the working file and the
+    in-memory graph both return to the recorded state. Unsaved changes are
+    discarded: by default the tool refuses when the working graph no longer
+    matches the current revision (un-checkpointed edits) or when a candidate is
+    pending - pass force=True to discard anyway.
+
+    - revision_id: revision to restore (default: the run's current revision)
+    - save_back: also overwrite the working .sbs path (ignored when the
+      working package lives inside the runs directory)
+    - force: discard un-checkpointed edits / supersede a pending candidate
+    """
+    result = await _material_op(_material_runs().restore_revision, run_id,
+                                revision_id=revision_id, save_back=save_back,
+                                force=force)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+async def propose_material_patch(ctx: Context,
+                                 run_id: Optional[str] = None,
+                                 operations: Optional[List[Dict[str, Any]]] = None,
+                                 notes: Optional[str] = None) -> str:
+    """
+    Propose a patch for the current revision. Does NOT modify the graph.
+
+    operations: ordered list of edits, at most 32, at most one output-size op:
+      {"op": "set_parameter", "node_id": "Blur", "parameter_id": "intensity",
+       "value": 12.0, "value_type": "float"}
+      {"op": "set_output_size", "width_log2": 11, "height_log2": 11}
+    value_type is optional (float/int/bool/string/float2/float3/float4/color/
+    int2/int3/int4). Node ids and parameters are validated against the live
+    graph, and the working graph must still match the run's current revision.
+    Returns the candidate (id, validation result, patch digest); an invalid
+    patch raises with every validation error.
+    """
+    result = await _material_op(_material_runs().propose_patch, run_id,
+                                operations=operations, notes=notes)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_UPDATE, structured_output=False)
+async def apply_material_patch(ctx: Context,
+                               run_id: Optional[str] = None,
+                               candidate_id: Optional[str] = None) -> str:
+    """
+    Apply the pending candidate's operations to the live graph.
+
+    Re-validates the patch, refuses if the working graph drifted from the
+    candidate's base revision, applies each operation through the plugin, then
+    automatically checkpoints the resulting state as a new revision (so a
+    rejected candidate can be rolled back precisely). On failure the graph is
+    restored from the base revision. Afterwards capture_material_preview and
+    record_material_evaluation are required before a decision.
+
+    candidate_id is optional when exactly one candidate is pending.
+    """
+    result = await _material_op(_material_runs().apply_patch, run_id,
+                                candidate_id=candidate_id)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def capture_material_preview(ctx: Context,
+                                   run_id: Optional[str] = None,
+                                   output_usages: Optional[List[str]] = None,
+                                   max_size: Optional[int] = None,
+                                   histogram_bins: Optional[int] = None,
+                                   include_3d: Optional[bool] = None,
+                                   wait_ms: Optional[int] = None,
+                                   refresh_first: Optional[bool] = None,
+                                   return_image: bool = True) -> list:
+    """
+    Capture the current revision's preview: a labeled multi-output contact
+    sheet with per-channel statistics plus a 3D render, in ONE call. Files are
+    stored under the run directory and recorded as artifacts bound to the
+    revision's fingerprint (used to reject stale evaluations).
+
+    Uses the run's preview_preset for omitted arguments. The 3D part is
+    best-effort: it needs the 3D view open in SD and is skipped with a warning
+    if binding/capture fails. The graph must still match the current revision.
+
+    Returns JSON (artifact paths, technical checks, stats) followed by the
+    contact sheet and 3D render images when return_image is True.
+    """
+    result = await _material_op(_material_runs().capture_preview, run_id,
+                                output_usages=output_usages,
+                                max_size=max_size,
+                                histogram_bins=histogram_bins,
+                                include_3d=include_3d, wait_ms=wait_ms,
+                                refresh_first=refresh_first)
+    content: list = [_material_json(result)]
+    if return_image:
+        for artifact in result.get("artifacts") or []:
+            path = artifact.get("path")
+            if path and os.path.isfile(path):
+                content.append(Image(path=path))
+    return content
+
+
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+async def record_material_evaluation(ctx: Context,
+                                     run_id: Optional[str] = None,
+                                     verdict: Optional[str] = None,
+                                     score: Optional[float] = None,
+                                     accepted: Optional[bool] = None,
+                                     evaluator: Optional[str] = None,
+                                     summary: Optional[str] = None,
+                                     criteria: Optional[List[str]] = None,
+                                     regression_threshold: float = 0.1) -> str:
+    """
+    Record the evaluation of the applied candidate from its latest preview.
+
+    Requires a fresh preview captured after apply (stale or missing previews
+    are rejected). Compares per-channel statistics against the candidate's
+    base revision preview and applies a technical regression check.
+
+    - verdict: free-text outcome (e.g. "better", "worse", "mixed")
+    - score: optional 0..1 quality score
+    - accepted: explicit decision; when omitted it defaults to technical_passed
+      and no channel regressions beyond regression_threshold
+    - criteria: checklist / notes that informed the verdict
+    - regression_threshold: relative mean change treated as a regression
+      (default 0.1 = 10%)
+    Returns the evaluation incl. per-channel comparisons and accepted.
+    """
+    result = await _material_op(_material_runs().record_evaluation, run_id,
+                                verdict=verdict, score=score, accepted=accepted,
+                                evaluator=evaluator, summary=summary,
+                                criteria=criteria,
+                                regression_threshold=regression_threshold)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_UPDATE, structured_output=False)
+async def decide_material_candidate(ctx: Context,
+                                    run_id: Optional[str] = None,
+                                    accepted: Optional[bool] = None,
+                                    restore: bool = True,
+                                    notes: Optional[str] = None) -> str:
+    """
+    Accept or reject the evaluated candidate.
+
+    - accepted: True keeps the applied state (it is already checkpointed as the
+      revision the run advances to); False restores the candidate's base
+      revision (unless restore=False, keeping the edits as a rejected state).
+      Omitted uses the recorded evaluation's accepted flag.
+    - notes: rationale stored with the decision.
+    The run returns to baseline_ready for the next iteration.
+    """
+    result = await _material_op(_material_runs().decide_candidate, run_id,
+                                accepted=accepted, restore=restore,
+                                notes=notes)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_UPDATE, structured_output=False)
+async def finish_material_run(ctx: Context,
+                              run_id: Optional[str] = None,
+                              notes: Optional[str] = None,
+                              restore_best: bool = True) -> str:
+    """
+    Close a run. By default restores the best accepted revision (or the
+    baseline when nothing was accepted) so the working package ends in the
+    chosen state, then marks the run finished and returns a summary.
+
+    - restore_best: False leaves the working graph as-is.
+    A pending candidate must be decided (or restored with
+    restore_material_revision) first.
+    """
+    result = await _material_op(_material_runs().finish_run, run_id,
+                                notes=notes, restore_best=restore_best)
+    return _material_json(result)
+
+
+# ---------------------------------------------------------------------------
 # Long jobs: stage-tracked, cancellable versions of the heavy computes
 # (inspect_outputs, get_map_stats, capture_2d_view, capture_node_preview).
 # The plugin steps each op
@@ -1813,7 +2195,7 @@ def _positive_float(value):
 
 def main():
     global _sd_port, _auth_token, _allow_arbitrary_code, _allow_dev_tools
-    global TIMEOUT, HEAVY_TIMEOUT
+    global TIMEOUT, HEAVY_TIMEOUT, _runs_dir
 
     parser = argparse.ArgumentParser(
         description=f"Substance Designer MCP Bridge v{BRIDGE_VERSION}")
@@ -1839,10 +2221,17 @@ def main():
     parser.add_argument("--allow-dev-tools", action="store_true",
                         help="Enable reload_plugin (re-executes plugin code "
                              "from disk; the plugin has its own gate).")
+    parser.add_argument("--runs-dir",
+                        help="Directory for material-run databases and "
+                             "revision checkpoints (default: SD_MCP_RUNS_DIR "
+                             "or %LOCALAPPDATA%%/sd_mcp/runs).")
     args = parser.parse_args()
     _sd_port = args.port
     TIMEOUT = args.timeout
     HEAVY_TIMEOUT = max(args.heavy_timeout, args.timeout)
+    _runs_dir = (os.path.abspath(os.path.expanduser(args.runs_dir))
+                 if args.runs_dir else None)
+    _reset_material_runs()
     _auth_token = args.token if args.token else os.environ.get("SD_MCP_TOKEN")
     _allow_arbitrary_code = args.allow_arbitrary_code or os.environ.get(
         "SD_MCP_ALLOW_EXECUTE_CODE", "").strip().lower() in ("1", "true", "yes", "on")
