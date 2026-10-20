@@ -31,6 +31,15 @@ async def _scene(client):
     return _json(await client.call_tool("get_scene_info", {}))
 
 
+async def _package_index_for_path(client, package_path):
+    wanted = os.path.normcase(os.path.abspath(package_path))
+    for entry in (await _scene(client))["packages"]:
+        path = entry.get("file_path")
+        if path and os.path.normcase(os.path.abspath(path)) == wanted:
+            return entry["index"]
+    return None
+
+
 def _plugin_version(scene):
     try:
         return tuple(int(part) for part in scene["plugin_version"].split("."))
@@ -78,22 +87,20 @@ async def scratch(client, tmp_path, monkeypatch):
     package_path = str(tmp_path / "scratch.sbs")
     await client.call_tool("save_package", {
         "package_index": package_index, "file_path": package_path})
-    scene = await _scene(client)
-    for entry in scene["packages"]:
-        if entry.get("file_path") and \
-                os.path.normcase(os.path.abspath(entry["file_path"])) == \
-                os.path.normcase(os.path.abspath(package_path)):
-            package_index = entry["index"]
-            break
+    package_index = await _package_index_for_path(client, package_path)
+    assert package_index is not None
 
     try:
         yield {"graph": graph_name, "package_index": package_index,
                "package_path": package_path}
     finally:
-        await client.call_tool("delete_graph", {
-            "graph_identifier": graph_name})
-        await client.call_tool("save_package", {
-            "package_path": package_path})
+        package_index = await _package_index_for_path(client, package_path)
+        assert package_index is not None
+        _json(await client.call_tool("delete_graph", {
+            "graph_identifier": graph_name,
+            "package_index": package_index}))
+        _json(await client.call_tool("save_package", {
+            "package_path": package_path}))
 
 
 async def test_live_material_run_workflow(client, scratch):
