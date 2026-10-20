@@ -10,7 +10,7 @@ Control Substance Designer from any MCP-compatible AI client (Claude Code, Claud
 
 - **Natural language → SD graph**: "Create a cracked concrete material" → 44-node PBR graph with height, normal, roughness, AO, baseColor, metallic outputs
 - **79 built-in material recipes**: pro-grade materials using the same node architecture as professional SD artists
-- **55 MCP tools**: get scene info, create/delete graphs, create nodes, connect nodes, set parameters, build full materials in one call, health check, snapshot, stage-tracked cancellable long jobs, and versioned material runs with package checkpoints and rollback
+- **57 MCP tools**: get scene info, create/delete graphs, create nodes, connect nodes, set parameters, build full materials in one call, health check, snapshot, stage-tracked cancellable long jobs, and versioned material runs with package checkpoints and rollback
 - **Library node support**: Clouds, Cells, Perlin Noise, Polygon, Edge Detect, Flood Fill, Multi-Directional Warp, etc.
 - **Thread-safe**: All SD API calls dispatched to Qt main thread via Signal/Slot queued connection
 
@@ -210,6 +210,81 @@ finish_material_run()                     # close, restoring the best accepted r
 Invalid patches, graph drift (manual edits since the checkpoint), stale previews
 and patch failures without a working rollback are rejected with explicit errors.
 `restore_material_revision` can return to any recorded revision later.
+
+**Hypothesis-driven refinement.** Each iteration should name one specific visual
+defect, make a targeted change for it, and predict the effect. Pass that with the
+patch; the evaluation then scores each prediction against the base and candidate
+preview stats:
+
+```
+propose_material_patch(operations=[...], hypothesis={
+    "defect": "roughness is flat; cavities and peaks read the same",
+    "observed_in": ["roughness"],
+    "rationale": "the blur washes out the cavity mask",
+    "expected_effect": "cavities glossier, peaks stay matte",
+    "predictions": [
+        {"output": "roughness", "metric": "mean", "direction": "decrease",
+         "min_change": 0.05, "max_change": 0.3},
+        {"output": "baseColor", "direction": "unchanged", "tolerance": 0.02}]})
+...
+record_material_evaluation(hypothesis_outcome="confirmed",
+                           observed_effect="cavities read wet now")
+```
+
+Each prediction is `confirmed`, `refuted`, `overshot` (moved past `max_change`)
+or `untestable`; the hypothesis as a whole is `confirmed`, `partial`, `refuted`
+or `inconclusive`, and an explicit `hypothesis_outcome` from the evaluator wins
+over the measured one. A refuted hypothesis is not auto-accepted, re-proposing
+operations that already failed is flagged, and `get_material_run` /
+the finish report carry a `hypothesis_log` of every defect, change, prediction
+and outcome. `start_material_run(require_hypothesis=True)` makes the hypothesis
+mandatory.
+
+**Material-aware evaluation.** Tell the run what the material is meant to look
+like and changes are judged against that, not by their sign:
+
+```
+start_material_run(graph_identifier="MyStone", material_profile="rough_dielectric",
+                   appearance_targets={"height": {"mean": [0.35, 0.6]}})
+```
+
+Profiles (`dielectric`, `metal`, `rough_dielectric`, `glossy_dielectric`) seed
+loose PBR bands; `appearance_targets` adds or overrides per-output ranges
+(`{"mean"|"min"|"max": [lo, hi], "channel": "r"}`, `null` for an open end).
+Each change beyond the regression threshold is classified as `toward_target`,
+`within_target`, `away_from_target`, `intended` (predicted by the hypothesis) or
+`side_effect`. Only moving away from an intended range, or leaving it, fails;
+unpredicted side effects are reported as warnings. Without targets or a
+hypothesis the old sign-based check still applies.
+
+**Controlled comparisons.** The run's first capture locks the comparison
+context: captured outputs, sheet size, histogram bins, each map's resolution and
+pixel format, the graph output size, and the 3D render size and timing. Later
+captures report `comparison_control`; an evaluation whose before/after captures
+differ (including a `set_output_size` patch) is flagged and not auto-accepted.
+Captures of a revision with a parent also get a `comparison_sheet`: the before
+and after contact sheets side by side at the same scale. SD's API does not
+expose the 3D view's camera, lighting or tiling, so leave the 3D view alone
+during a run; only its render size and timing can be verified.
+
+**Semantic graph understanding.** `analyze_material_graph` walks upstream from
+every output and labels nodes as `macro_shape`, `edge_breakup`, `surface_grain`,
+`height_processing`, `normal_processing`, `color`, `roughness` or `metallic`,
+with the outputs each node reaches, a reason, a confidence and its tunable
+parameters. The roles are heuristics (node definition names plus scale/tiling
+parameters), so treat low-confidence ones as guesses. A hypothesis can name a
+`target_role`. Patch validation warns when an edited node doesn't feed the
+outputs the hypothesis targets (`node_not_upstream`) or looks like a different
+role (`role_mismatch`).
+
+**Export and delivery validation.** `validate_material_delivery` exports the
+current revision's outputs with `SDTexture.save` and re-reads the files. It
+checks that every required output is present and non-empty, the file format,
+the header dimensions and bit depth (PNG, TIFF and EXR headers are parsed), the
+resolution, and square, uniform sizes. Start a run with `delivery={...}`
+(`{}` for the defaults: six PBR outputs, PNG, at least 512 px, 8-bit with
+16-bit height) and `finish_material_run` refuses until the final revision
+passes. These need plugin v3.10.0 (`export_outputs`, `compose_comparison`).
 
 Checkpoints and restores need plugin v3.9.0, so restart Substance Designer after
 updating. The opt-in `tests/test_material_live.py` exercises the whole workflow

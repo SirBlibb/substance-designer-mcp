@@ -45,6 +45,10 @@ class FakeDesigner:
         self.fail_verify = False
         self.drop_usage = None
         self.effect = 0.5
+        self.export_bits = 8
+        self.export_size = 2048
+        self.export_skip = None
+        self.compose_supported = True
         self.active = 0
         self.max_active = 0
         self._active_lock = threading.Lock()
@@ -67,17 +71,27 @@ class FakeDesigner:
                           "position": [100.0, 200.0], "is_output": False,
                           "is_library": False, "inputs": inputs,
                           "annotations": []})
+        connections = [{"from_node": "noise",
+                        "from_output": "unique_filter_output",
+                        "to_node": "blur", "to_input": "input1"}]
+        for usage in USAGES:
+            nodes.append({"id": "out_" + usage,
+                          "definition": "sbs::compositing::output",
+                          "position": [400.0, 200.0], "is_output": True,
+                          "is_library": False, "inputs": [],
+                          "annotations": [{"id": "label", "value": LABELS[usage]}]})
+            connections.append({"from_node": "blur",
+                                "from_output": "unique_filter_output",
+                                "to_node": "out_" + usage, "to_input": "inputNodeOutput"})
         return {
             "graph_identifier": GRAPH,
             "nodes": nodes,
-            "connections": [{"from_node": "noise",
-                             "from_output": "unique_filter_output",
-                             "to_node": "blur", "to_input": "input1"}],
+            "connections": connections,
             "graph_inputs": [{
                 "id": "$outputsize",
                 "value": {"x": self.outputsize[0], "y": self.outputsize[1]},
             }],
-            "output_node_ids": [],
+            "output_node_ids": ["out_" + u for u in USAGES],
         }
 
     # ── command dispatch ───────────────────────────────────────────────
@@ -205,7 +219,37 @@ class FakeDesigner:
                 fh.write(b"PNG3D")
             return {"path": path, "width": 8, "height": 8,
                     "method": "printwindow"}
+        if cmd == "export_outputs":
+            outputs, skipped = [], []
+            for usage in params["output_usages"]:
+                if usage == self.export_skip:
+                    skipped.append({"usage": usage, "reason": "not found"})
+                    continue
+                path = os.path.join(params["output_dir"], "G_{}.png".format(usage))
+                os.makedirs(params["output_dir"], exist_ok=True)
+                bits = 16 if (usage == "height" and self.export_bits >= 16) else self.export_bits
+                with open(path, "wb") as fh:
+                    fh.write(png_header(self.export_size, self.export_size, bits))
+                outputs.append({"usage": usage, "label": LABELS.get(usage, usage),
+                                "path": path, "width": self.export_size,
+                                "height": self.export_size,
+                                "pixel_format": "RGBA16" if bits == 16 else "RGBA8"})
+            return {"graph": GRAPH, "output_dir": params["output_dir"],
+                    "outputs": outputs, "skipped": skipped}
+        if cmd == "compose_comparison" and self.compose_supported:
+            with open(params["output_path"], "wb") as fh:
+                fh.write(b"PNGCMP")
+            return {"path": params["output_path"], "width": 64, "height": 32}
         raise mr.DesignerError("Unknown command '{}'".format(cmd))
+
+
+def png_header(width, height, bits, colour=6):
+    import struct
+    import zlib
+    ihdr = struct.pack(">IIBBBBB", width, height, bits, colour, 0, 0, 0)
+    chunk = b"IHDR" + ihdr
+    return (b"\x89PNG\r\n\x1a\n" + struct.pack(">I", len(ihdr)) + chunk
+            + struct.pack(">I", zlib.crc32(chunk)))
 
 
 @pytest.fixture
@@ -395,7 +439,7 @@ def test_cycle_capture_and_evaluation(env):
     preview, evaluation = _cycle(controller, run_id)
     assert preview["technical_passed"] is True
     kinds = [a["kind"] for a in preview["artifacts"]]
-    assert kinds == ["outputs_sheet", "render_3d"]
+    assert kinds == ["outputs_sheet", "render_3d", "comparison_sheet"]
     assert all(os.path.isfile(a["path"]) for a in preview["artifacts"])
     assert preview["source_fingerprint"]
     assert evaluation["evaluation"]["technical_passed"] is True
@@ -649,3 +693,222 @@ def test_operations_are_serialized(env):
         thread.join()
     assert not errors
     assert designer.max_active == 1
+
+
+# ── hypothesis-driven refinement ───────────────────────────────────────────
+
+BLUR_UP = [{"op": "set_parameter", "node_id": "blur",
+            "parameter_id": "intensity", "value": 9.0}]
+
+
+def _hypothesis(*predictions, **extra):
+    data = {"defect": "roughness reads flat across cavities",
+            "observed_in": "roughness",
+            "expected_effect": "roughness brightens overall",
+            "predictions": list(predictions)}
+    data.update(extra)
+    return data
+
+
+def _hypothesis_cycle(controller, run_id, hypothesis, operations=BLUR_UP, **evaluation):
+    controller.propose_patch(run_id, operations, hypothesis=hypothesis)
+    controller.apply_patch(run_id)
+    controller.capture_preview(run_id)
+    return controller.record_evaluation(run_id, **evaluation)["evaluation"]
+
+
+def _ready(controller, **kwargs):
+    run_id = _start(controller, **kwargs)
+    _baseline(controller, run_id)
+    controller.capture_preview(run_id)
+    return run_id
+
+
+def test_hypothesis_is_normalised_onto_the_candidate(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    result = controller.propose_patch(run_id, BLUR_UP, hypothesis=_hypothesis(
+        {"output": "roughness", "direction": "increase", "min_change": 0.1}))
+    hypothesis = result["candidate"]["patch"]["hypothesis"]
+    assert hypothesis["observed_in"] == ["roughness"]
+    assert hypothesis["predictions"] == [{"output": "roughness", "metric": "mean",
+                                          "direction": "increase", "min_change": 0.1}]
+    codes = [w["code"] for w in result["candidate"]["validation"]["warnings"]]
+    assert "no_hypothesis" not in codes
+
+
+def test_patch_without_hypothesis_warns(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    result = controller.propose_patch(run_id, BLUR_UP)
+    codes = [w["code"] for w in result["candidate"]["validation"]["warnings"]]
+    assert codes == ["no_hypothesis"]
+    assert "hypothesis" not in result["candidate"]["patch"]
+
+
+def test_require_hypothesis_rejects_bare_patch(env):
+    designer, store, controller = env
+    run_id = _ready(controller, require_hypothesis=True)
+    assert store.get_run(run_id).require_hypothesis is True
+    with pytest.raises(mr.RunError, match="requires a hypothesis"):
+        controller.propose_patch(run_id, BLUR_UP)
+    assert store.list_candidates(run_id)[-1].status == mr.CAND_INVALID
+    assert store.get_run(run_id).state == "baseline_ready"
+
+
+@pytest.mark.parametrize("hypothesis, message", [
+    ({"expected_effect": "x"}, "defect is required"),
+    (_hypothesis({"output": "roughness", "direction": "sideways"}), "direction"),
+    (_hypothesis({"output": "roughness", "direction": "increase",
+                  "metric": "median"}), "metric"),
+    (_hypothesis({"output": "roughness", "direction": "unchanged",
+                  "min_change": 0.1}), "tolerance"),
+    (_hypothesis({"output": "roughness", "direction": "increase",
+                  "min_change": 0.3, "max_change": 0.1}), "below min_change"),
+    (_hypothesis(guess="x"), "Unknown hypothesis field"),
+])
+def test_invalid_hypotheses_are_rejected(env, hypothesis, message):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    with pytest.raises(mr.RunError, match=message):
+        controller.propose_patch(run_id, BLUR_UP, hypothesis=hypothesis)
+
+
+def test_confirmed_prediction_is_accepted(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    evaluation = _hypothesis_cycle(controller, run_id, _hypothesis(
+        {"output": "roughness", "direction": "increase", "min_change": 0.1}))
+    check = evaluation["hypothesis_check"]
+    assert check["measured_outcome"] == "confirmed"
+    assert check["outcome"] == "confirmed"
+    assert check["predictions"][0]["before"] == pytest.approx(0.75)
+    assert check["predictions"][0]["after"] == pytest.approx(0.95)
+    assert evaluation["accepted"] is True
+
+
+def test_refuted_prediction_is_not_auto_accepted(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    evaluation = _hypothesis_cycle(controller, run_id, _hypothesis(
+        {"output": "roughness", "direction": "decrease"}))
+    assert evaluation["technical_passed"] is True
+    assert not evaluation["comparisons"]["threshold_failures"]
+    assert evaluation["hypothesis_check"]["outcome"] == "refuted"
+    assert evaluation["accepted"] is False
+
+
+def test_overshoot_and_unchanged_give_partial(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    evaluation = _hypothesis_cycle(controller, run_id, _hypothesis(
+        {"output": "roughness", "direction": "increase", "max_change": 0.1},
+        {"output": "baseColor", "direction": "increase"},
+        {"output": "metallic", "direction": "unchanged", "tolerance": 0.5}))
+    outcomes = [p["outcome"] for p in evaluation["hypothesis_check"]["predictions"]]
+    assert outcomes == ["overshot", "confirmed", "confirmed"]
+    assert evaluation["hypothesis_check"]["outcome"] == "partial"
+
+
+def test_evaluator_outcome_overrides_measurement(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    evaluation = _hypothesis_cycle(
+        controller, run_id,
+        _hypothesis({"output": "roughness", "direction": "increase"}),
+        hypothesis_outcome="Refuted", observed_effect="speckles appeared instead")
+    check = evaluation["hypothesis_check"]
+    assert check["measured_outcome"] == "confirmed"
+    assert check["assessed_outcome"] == "refuted"
+    assert check["outcome"] == "refuted"
+    assert check["observed_effect"] == "speckles appeared instead"
+    assert evaluation["accepted"] is False
+
+
+def test_hypothesis_outcome_validation(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    _propose_and_apply(controller, run_id, BLUR_UP)
+    controller.capture_preview(run_id)
+    with pytest.raises(mr.RunError, match="no hypothesis"):
+        controller.record_evaluation(run_id, hypothesis_outcome="confirmed")
+    with pytest.raises(mr.RunError, match="must be one of"):
+        controller.record_evaluation(run_id, hypothesis_outcome="maybe")
+
+
+def test_predictions_without_base_stats_are_inconclusive(env):
+    designer, store, controller = env
+    run_id = _start(controller)
+    _baseline(controller, run_id)  # no baseline preview captured
+    evaluation = _hypothesis_cycle(controller, run_id, _hypothesis(
+        {"output": "roughness", "direction": "increase"}))
+    check = evaluation["hypothesis_check"]
+    assert check["predictions"][0]["outcome"] == "untestable"
+    assert check["outcome"] == "inconclusive"
+
+
+def test_uncaptured_prediction_output_warns(env):
+    designer, store, controller = env
+    run_id = _ready(controller, preview_preset={"output_usages": ["roughness"]})
+    result = controller.propose_patch(run_id, BLUR_UP, hypothesis=_hypothesis(
+        {"output": "height", "direction": "increase"}))
+    codes = [w["code"] for w in result["candidate"]["validation"]["warnings"]]
+    assert "prediction_not_captured" in codes
+
+
+def test_repeating_a_refuted_change_warns(env):
+    designer, store, controller = env
+    run_id = _ready(controller)
+    first = _hypothesis_cycle(controller, run_id, _hypothesis(
+        {"output": "roughness", "direction": "decrease"}))
+    controller.decide_candidate(run_id)
+    assert store.get_candidate(first["candidate_id"]).status == mr.CAND_REJECTED
+    result = controller.propose_patch(run_id, BLUR_UP, hypothesis=_hypothesis(
+        {"output": "roughness", "direction": "increase"}))
+    warnings = result["candidate"]["validation"]["warnings"]
+    assert [w["code"] for w in warnings] == ["repeats_failed_candidate"]
+    assert first["candidate_id"] in warnings[0]["message"]
+
+
+def test_hypothesis_log_in_bundle_and_report(env):
+    designer, store, controller = env
+    run_id = _ready(controller, max_iterations=2)
+    _hypothesis_cycle(controller, run_id, _hypothesis(
+        {"output": "roughness", "direction": "decrease"}),
+        observed_effect="got brighter, not darker")
+    controller.decide_candidate(run_id)
+    _hypothesis_cycle(controller, run_id, _hypothesis(
+        {"output": "roughness", "direction": "increase"},
+        defect="peaks too dark"))
+    controller.decide_candidate(run_id)
+
+    log = controller.get_run(run_id)["hypothesis_log"]
+    assert [e["outcome"] for e in log] == ["refuted", "confirmed"]
+    assert [e["accepted"] for e in log] == [False, True]
+    assert log[0]["observed_effect"] == "got brighter, not darker"
+    assert log[1]["defect"] == "peaks too dark"
+    assert log[1]["operations"] == BLUR_UP
+
+    report = store.get_run(run_id).report
+    assert [e["outcome"] for e in report["hypothesis_log"]] == ["refuted", "confirmed"]
+    assert report["candidates"][1]["hypothesis"]["defect"] == "peaks too dark"
+
+
+def test_store_migrates_pre_hypothesis_databases(tmp_path):
+    import sqlite3
+    db = str(tmp_path / "old.sqlite3")
+    old_schema = mr._SCHEMA.replace(
+        ",\n    require_hypothesis INTEGER NOT NULL DEFAULT 0", "").replace(
+        ",\n    hypothesis_check TEXT", "")
+    assert "require_hypothesis" not in old_schema
+    assert "hypothesis_check" not in old_schema
+    conn = sqlite3.connect(db)
+    conn.executescript(old_schema)
+    conn.close()
+    mr.MaterialRunStore(db)
+    conn = sqlite3.connect(db)
+    run_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    eval_cols = {row[1] for row in conn.execute("PRAGMA table_info(evaluations)")}
+    conn.close()
+    assert "require_hypothesis" in run_cols
+    assert "hypothesis_check" in eval_cols

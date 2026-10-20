@@ -39,6 +39,29 @@ Patch semantics: allowed operations are ``set_parameter`` and
 invalid, fails to apply, or produces no observable change is rejected and the
 working graph is rolled back to the base revision checkpoint.
 
+Hypothesis-driven refinement: a candidate may carry a *hypothesis* that names
+the specific visual defect it targets, the expected visual effect, and
+measurable predictions (``output`` / ``channel`` / ``metric`` moving in a
+``direction``). ``record_material_evaluation`` checks each prediction against
+the base and candidate preview stats and records whether the hypothesis was
+confirmed, partially confirmed or refuted; a refuted hypothesis is never
+auto-accepted. Runs started with ``require_hypothesis=True`` refuse patches
+without one, and the run bundle/report keep a per-iteration hypothesis log so
+the next iteration can build on (or avoid repeating) earlier ones.
+
+Material-aware evaluation: a run may declare its intended appearance
+(``material_profile`` and/or ``appearance_targets``). Changes are then judged
+by whether they move each map toward or away from its intended range, and
+changes nobody predicted are reported as side effects instead of being treated
+as regressions by sign. Comparisons are controlled: the first capture locks
+the capture context (outputs, sheet size, bins, map resolution/format, 3D
+render size/timing) and an evaluation whose before/after captures differ is
+flagged and not auto-accepted. ``analyze_graph`` classifies nodes by role
+(macro shape, edge breakup, grain, colour, roughness...) and patch validation
+warns when an edited node cannot affect the outputs its hypothesis targets.
+A run started with ``delivery`` cannot finish until an export of the best
+revision passes the delivery checks (outputs, resolution, bit depth, files).
+
 This module is dependency-free by design so tests can drive the full state
 machine with a fake designer.
 """
@@ -55,6 +78,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+import sd_material_quality as quality
+
 __all__ = [
     "DesignerError", "RunError",
     "MaterialPatchOperation", "MaterialPatch",
@@ -63,6 +88,7 @@ __all__ = [
     "canonical_json", "structure_sha256", "fingerprint_sha256",
     "DEFAULT_PREVIEW_PRESET", "DEFAULT_MAX_ITERATIONS",
     "ALLOWED_PATCH_OPS", "ALLOWED_VALUE_TYPES", "PATCH_MAX_OPERATIONS",
+    "HYPOTHESIS_DIRECTIONS", "HYPOTHESIS_OUTCOMES",
 ]
 
 # ---------------------------------------------------------------------------
@@ -84,6 +110,8 @@ CMD_SEND_3D = "send_to_3d_view"
 CMD_SEND_3D_STATUS = "send_to_3d_view_status"
 CMD_CAPTURE_3D = "capture_3d_view"
 CMD_SCENE_INFO = "get_scene_info"
+CMD_EXPORT_OUTPUTS = "export_outputs"
+CMD_COMPOSE_COMPARISON = "compose_comparison"
 
 STATE_CREATED = "created"
 STATE_BASELINE_READY = "baseline_ready"
@@ -151,6 +179,18 @@ DEFAULT_PREVIEW_PRESET: Dict[str, Any] = {
 }
 
 _METRICS = ("min", "max", "mean")
+
+HYPOTHESIS_DIRECTIONS = ("increase", "decrease", "unchanged")
+#: Overall hypothesis outcomes (measured from stats or assessed by the evaluator).
+HYPOTHESIS_OUTCOMES = ("confirmed", "partial", "refuted", "inconclusive")
+HYPOTHESIS_MAX_PREDICTIONS = 16
+#: Default relative change a directional prediction needs to count as
+#: confirmed, and the band an "unchanged" prediction must stay within.
+DEFAULT_PREDICTION_TOLERANCE = 0.02
+_HYPOTHESIS_KEYS = frozenset({"defect", "observed_in", "rationale",
+                              "expected_effect", "predictions", "target_role"})
+_PREDICTION_KEYS = frozenset({"output", "channel", "metric", "direction",
+                              "min_change", "max_change", "tolerance"})
 
 
 # ---------------------------------------------------------------------------
@@ -329,17 +369,22 @@ class MaterialPatchOperation:
 class MaterialPatch:
     operations: List[MaterialPatchOperation] = field(default_factory=list)
     notes: str = ""
+    hypothesis: Optional[dict] = None
 
     @classmethod
-    def from_operations(cls, operations: List[dict], notes: str = "") -> "MaterialPatch":
+    def from_operations(cls, operations: List[dict], notes: str = "",
+                        hypothesis: Optional[dict] = None) -> "MaterialPatch":
         if not isinstance(operations, list):
             raise RunError("'operations' must be a list of patch operation objects.")
         return cls(operations=[MaterialPatchOperation.from_dict(op) for op in operations],
-                   notes=notes or "")
+                   notes=notes or "", hypothesis=hypothesis)
 
     def to_dict(self) -> dict:
-        return {"operations": [op.to_dict() for op in self.operations],
-                "notes": self.notes}
+        out: Dict[str, Any] = {"operations": [op.to_dict() for op in self.operations],
+                               "notes": self.notes}
+        if self.hypothesis is not None:
+            out["hypothesis"] = self.hypothesis
+        return out
 
 
 @dataclass
@@ -364,6 +409,11 @@ class MaterialRun:
     report: Optional[dict]
     finished_at: Optional[float]
     error: Optional[str]
+    require_hypothesis: bool = False
+    appearance: Optional[dict] = None
+    comparison_context: Optional[dict] = None
+    delivery_spec: Optional[dict] = None
+    delivery: Optional[dict] = None
 
 
 @dataclass
@@ -424,6 +474,7 @@ class MaterialEvaluation:
     technical_passed: bool
     warnings: list
     artifact_id: Optional[int]
+    hypothesis_check: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +486,8 @@ _RUN_COLUMNS = (
     "package_index", "package_path", "goal", "max_iterations", "iteration",
     "baseline_revision_id", "current_revision_id", "best_revision_id",
     "preview_preset", "constraints", "seeds", "transitions", "report",
-    "finished_at", "error",
+    "finished_at", "error", "require_hypothesis",
+    "appearance", "comparison_context", "delivery_spec", "delivery",
 )
 _REVISION_COLUMNS = (
     "revision_id", "run_id", "seq", "created_at", "parent_revision_id",
@@ -453,6 +505,7 @@ _EVALUATION_COLUMNS = (
     "evaluator", "summary", "verdict", "accepted", "score", "criteria",
     "regression_threshold", "baseline_revision_id", "comparisons",
     "technical_checks", "technical_passed", "warnings", "artifact_id",
+    "hypothesis_check",
 )
 _ARTIFACT_COLUMNS = (
     "artifact_id", "run_id", "revision_id", "kind", "path", "sha256",
@@ -472,6 +525,17 @@ class MaterialRunStore:
             os.makedirs(parent, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add columns introduced after a store was first created."""
+        for table, column, decl in _ADDED_COLUMNS:
+            existing = {row[1] for row in conn.execute(
+                "PRAGMA table_info({})".format(table))}
+            if column not in existing:
+                conn.execute("ALTER TABLE {} ADD COLUMN {} {}".format(
+                    table, column, decl))
 
     @contextmanager
     def _connect(self):
@@ -548,7 +612,10 @@ class MaterialRunStore:
 
     def _row_to_run(self, row: sqlite3.Row) -> MaterialRun:
         record = self._decode(row, ("preview_preset", "constraints", "seeds",
-                                    "transitions", "report"))
+                                    "transitions", "report", "appearance",
+                                    "comparison_context", "delivery_spec",
+                                    "delivery"))
+        record["require_hypothesis"] = bool(record.get("require_hypothesis"))
         return MaterialRun(**{key: record.get(key) for key in _RUN_COLUMNS})
 
     # ── revisions ────────────────────────────────────────────────────────
@@ -658,7 +725,7 @@ class MaterialRunStore:
 
     def _row_to_evaluation(self, row: sqlite3.Row) -> MaterialEvaluation:
         record = self._decode(row, ("criteria", "comparisons", "technical_checks",
-                                    "warnings"))
+                                    "warnings", "hypothesis_check"))
         record["accepted"] = bool(record.get("accepted"))
         record["technical_passed"] = bool(record.get("technical_passed"))
         return MaterialEvaluation(**{key: record.get(key) for key in _EVALUATION_COLUMNS})
@@ -689,6 +756,11 @@ class MaterialRunStore:
                      ("error", error),
                  )])
             return int(cursor.lastrowid)
+
+    def update_artifact_config(self, artifact_id: int, config: dict) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE artifacts SET config = ? WHERE artifact_id = ?",
+                         (self._encode(config), int(artifact_id)))
 
     def list_artifacts(self, run_id: str,
                        revision_id: Optional[str] = None) -> List[dict]:
@@ -739,7 +811,12 @@ CREATE TABLE IF NOT EXISTS runs (
     transitions TEXT,
     report TEXT,
     finished_at REAL,
-    error TEXT
+    error TEXT,
+    require_hypothesis INTEGER NOT NULL DEFAULT 0,
+    appearance TEXT,
+    comparison_context TEXT,
+    delivery_spec TEXT,
+    delivery TEXT
 );
 CREATE TABLE IF NOT EXISTS revisions (
     revision_id TEXT PRIMARY KEY,
@@ -794,7 +871,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
     technical_checks TEXT,
     technical_passed INTEGER NOT NULL DEFAULT 0,
     warnings TEXT,
-    artifact_id INTEGER
+    artifact_id INTEGER,
+    hypothesis_check TEXT
 );
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -815,6 +893,17 @@ CREATE INDEX IF NOT EXISTS idx_candidates_run ON candidates(run_id);
 CREATE INDEX IF NOT EXISTS idx_evaluations_run ON evaluations(run_id);
 CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id, kind);
 """
+
+#: (table, column, declaration) for columns added after the first release, so
+#: stores created by an older bridge are upgraded in place.
+_ADDED_COLUMNS = (
+    ("runs", "require_hypothesis", "INTEGER NOT NULL DEFAULT 0"),
+    ("evaluations", "hypothesis_check", "TEXT"),
+    ("runs", "appearance", "TEXT"),
+    ("runs", "comparison_context", "TEXT"),
+    ("runs", "delivery_spec", "TEXT"),
+    ("runs", "delivery", "TEXT"),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1037,7 +1126,12 @@ class MaterialRunController:
                   constraints: Optional[list] = None,
                   seeds: Optional[dict] = None,
                   package_index: int = 0,
-                  package_path: Optional[str] = None) -> dict:
+                  package_path: Optional[str] = None,
+                  require_hypothesis: bool = False,
+                  material_profile: Optional[str] = None,
+                  appearance_targets: Optional[dict] = None,
+                  appearance_description: Optional[str] = None,
+                  delivery: Any = None) -> dict:
         with self._lock:
             if not graph_identifier or not isinstance(graph_identifier, str):
                 raise RunError("graph_identifier is required.")
@@ -1061,6 +1155,18 @@ class MaterialRunController:
             checks, check_errors = self._validate_constraints(constraints or [])
             if check_errors:
                 raise RunError("Invalid constraints: " + "; ".join(check_errors))
+            appearance = None
+            if material_profile or appearance_targets or appearance_description:
+                appearance, appearance_errors = quality.normalize_appearance(
+                    material_profile, appearance_targets, appearance_description)
+                if appearance_errors:
+                    raise RunError("Invalid appearance: " + "; ".join(appearance_errors))
+            delivery_spec = None
+            if delivery is not None and delivery is not False:
+                delivery_spec, delivery_errors = quality.normalize_delivery_spec(
+                    delivery if isinstance(delivery, dict) else None)
+                if delivery_errors:
+                    raise RunError("Invalid delivery spec: " + "; ".join(delivery_errors))
 
             # Fail fast if the graph is not resolvable.
             scene, error = self._call_optional(
@@ -1081,7 +1187,9 @@ class MaterialRunController:
                 constraints=checks, seeds=dict(seeds or {}),
                 transitions=[{"at": now, "from": None, "to": STATE_CREATED,
                               "reason": "run created"}],
-                report=None, finished_at=None, error=None)
+                report=None, finished_at=None, error=None,
+                require_hypothesis=bool(require_hypothesis),
+                appearance=appearance, delivery_spec=delivery_spec)
             self.store.insert_run(run)
             return {"run": self._public_run(self.store.get_run(run_id))}
 
@@ -1271,7 +1379,8 @@ class MaterialRunController:
 
     def propose_patch(self, run_id: Optional[str] = None,
                       operations: Optional[List[dict]] = None,
-                      notes: Optional[str] = None) -> dict:
+                      notes: Optional[str] = None,
+                      hypothesis: Optional[dict] = None) -> dict:
         with self._lock:
             run = self._require_run(run_id)
             if run.state != STATE_BASELINE_READY:
@@ -1291,6 +1400,7 @@ class MaterialRunController:
 
             patch = MaterialPatch.from_operations(operations, notes or "")
             validation = self._validate_patch(run, patch)
+            self._validate_hypothesis(run, patch, hypothesis, validation)
             candidate_id = "cand_" + uuid.uuid4().hex[:10]
             candidate = MaterialCandidate(
                 candidate_id=candidate_id, run_id=run.run_id,
@@ -1564,12 +1674,41 @@ class MaterialRunController:
                 else:
                     artifacts.append(render)
 
+            context = quality.comparison_context(
+                sheet_cfg, stats, revision.output_config, render)
+            lock = run.comparison_context
+            if lock is None:
+                # The first capture of a run defines the comparison context
+                # every later capture is held to.
+                self.store.update_run(run.run_id, comparison_context=context)
+                lock = context
+            control = quality.diff_contexts(lock, context)
+            if not control["controlled"]:
+                warnings.append(
+                    "Capture settings differ from the run's locked comparison "
+                    "context ({}); before/after comparisons with this capture are "
+                    "not controlled.".format(", ".join(
+                        m["field"] for m in control["mismatches"])))
+            sheet_cfg["context"] = context
+            sheet_cfg["control"] = control
+            self.store.update_artifact_config(sheet_id, sheet_cfg)
+
+            comparison = self._compose_comparison(run, revision, sheet_id, sheet_file,
+                                                  rev_dir, stamp, full_sha)
+            if comparison is not None:
+                if comparison.get("error"):
+                    warnings.append("Side-by-side comparison unavailable: {}".format(
+                        comparison["error"]))
+                else:
+                    artifacts.append(comparison)
+
             technical_passed = all(c.get("passed") for c in checks)
             return {
                 "run_id": run.run_id,
                 "revision_id": revision.revision_id,
                 "captured_at": self._clock(),
                 "source_fingerprint": full_sha,
+                "comparison_control": control,
                 "artifacts": artifacts,
                 "technical_checks": checks,
                 "technical_passed": technical_passed,
@@ -1620,15 +1759,60 @@ class MaterialRunController:
             return None, "capture_3d_view produced no file"
         artifact = {"kind": "render_3d", "path": path,
                     "sha256": sha256_file(path),
-                    "width": shot.get("width"), "height": shot.get("height")}
+                    "width": shot.get("width"), "height": shot.get("height"),
+                    "wait_ms": wait_ms, "refresh_first": bool(refresh_first)}
         artifact_id = self.store.insert_artifact(
             run_id=run.run_id, revision_id=revision.revision_id,
             kind="render_3d", path=path, sha256=artifact["sha256"],
-            config={"wait_ms": wait_ms, "refresh_first": refresh_first},
+            config={"wait_ms": wait_ms, "refresh_first": refresh_first,
+                    "width": shot.get("width"), "height": shot.get("height")},
             stats=None, source_fingerprint=source_fingerprint,
             status="ok", error=None)
         artifact["artifact_id"] = artifact_id
         return artifact, None
+
+    def _compose_comparison(self, run: MaterialRun, revision: MaterialRevision,
+                            sheet_id: int, sheet_file: str, rev_dir: str,
+                            stamp: str, source_fingerprint: str) -> Optional[dict]:
+        """Stitch the parent revision's contact sheet next to this one.
+
+        Returns None when there is nothing to compare against, an artifact
+        dict on success, or {"error": ...} when the plugin cannot compose.
+        """
+        if not revision.parent_revision_id or not sheet_file or \
+                not os.path.isfile(sheet_file):
+            return None
+        parent = self.store.latest_artifact(run.run_id, kind="outputs_sheet",
+                                            revision_id=revision.parent_revision_id)
+        if not parent or parent.get("status") != "ok" or not parent.get("path") \
+                or not os.path.isfile(parent["path"]):
+            return None
+        parent_rev = self.store.get_revision(revision.parent_revision_id)
+        out_path = os.path.join(rev_dir, "{}_compare.png".format(stamp))
+        result, error = self._call_optional(CMD_COMPOSE_COMPARISON, {
+            "left_path": parent["path"],
+            "right_path": sheet_file,
+            "output_path": out_path,
+            "left_label": "before: {}".format(parent_rev.label if parent_rev
+                                              else revision.parent_revision_id),
+            "right_label": "after: {}".format(revision.label),
+        })
+        if error:
+            return {"error": error}
+        path = (result or {}).get("path") or out_path
+        if not os.path.isfile(path):
+            return {"error": "compose_comparison produced no file"}
+        sha = sha256_file(path)
+        artifact_id = self.store.insert_artifact(
+            run_id=run.run_id, revision_id=revision.revision_id,
+            kind="comparison_sheet", path=path, sha256=sha,
+            config={"left_artifact_id": parent.get("artifact_id"),
+                    "right_artifact_id": sheet_id},
+            stats=None, source_fingerprint=source_fingerprint)
+        return {"artifact_id": artifact_id, "kind": "comparison_sheet",
+                "path": path, "sha256": sha,
+                "width": (result or {}).get("width"),
+                "height": (result or {}).get("height")}
 
     def record_evaluation(self, run_id: Optional[str] = None,
                           verdict: Optional[str] = None,
@@ -1637,7 +1821,9 @@ class MaterialRunController:
                           evaluator: Optional[str] = None,
                           summary: Optional[str] = None,
                           criteria: Optional[list] = None,
-                          regression_threshold: Optional[float] = None) -> dict:
+                          regression_threshold: Optional[float] = None,
+                          hypothesis_outcome: Optional[str] = None,
+                          observed_effect: Optional[str] = None) -> dict:
         with self._lock:
             run = self._require_run(run_id)
             if run.state != STATE_AWAITING_EVALUATION:
@@ -1648,6 +1834,15 @@ class MaterialRunController:
             candidate = self._pending_candidate(run)
             if candidate is None or candidate.status != CAND_APPLIED:
                 raise RunError("No applied candidate is awaiting evaluation.")
+            hypothesis = (candidate.patch or {}).get("hypothesis")
+            if hypothesis_outcome is not None:
+                hypothesis_outcome = str(hypothesis_outcome).strip().lower()
+                if hypothesis_outcome not in HYPOTHESIS_OUTCOMES:
+                    raise RunError("hypothesis_outcome must be one of {} (got {!r}).".format(
+                        ", ".join(HYPOTHESIS_OUTCOMES), hypothesis_outcome))
+                if not hypothesis:
+                    raise RunError("Candidate '{}' has no hypothesis to assess; omit "
+                                   "hypothesis_outcome.".format(candidate.candidate_id))
             # The candidate's *base* revision is where the patch started; the
             # applied state was auto-checkpointed as the current revision.
             applied_id = (candidate.apply_result or {}).get("result_revision_id")
@@ -1690,18 +1885,58 @@ class MaterialRunController:
             after_stats = artifact.get("stats") or {}
             threshold = float(regression_threshold if regression_threshold is not None
                               else DEFAULT_REGRESSION_THRESHOLD)
-            comparisons = self._compare_stats(before_stats, after_stats, threshold)
+            comparisons = quality.classify_changes(
+                before_stats, after_stats, threshold, run.appearance, hypothesis)
+            comparisons["appearance_checks"] = quality.appearance_checks(
+                run.appearance, before_stats, after_stats)
+            appearance_regressions = [c for c in comparisons["appearance_checks"]
+                                      if c["status"] == "left_range"]
+            if comparisons["side_effects"]:
+                warnings.append("{} unpredicted change(s) beyond the threshold "
+                                "(side effects): {}".format(
+                                    len(comparisons["side_effects"]), ", ".join(
+                                        "{}.{}.{} {:+.0%}".format(
+                                            e["output"], e["channel"], e["metric"],
+                                            e["relative"])
+                                        for e in comparisons["side_effects"][:6])))
+            before_context = ((before_artifact or {}).get("config") or {}).get("context")
+            after_context = (artifact.get("config") or {}).get("context")
+            control = None
+            if before_stats is not None:
+                control = quality.diff_contexts(before_context, after_context)
+                if not control["controlled"]:
+                    warnings.append(
+                        "Before/after captures were not taken under the same "
+                        "conditions ({}); numeric comparisons may be "
+                        "misleading.".format(", ".join(
+                            m["field"] for m in control["mismatches"])))
+            comparisons["control"] = control
             artifact_cfg = artifact.get("config") or {}
             checks = self._technical_checks(
                 run, after_stats, artifact_cfg.get("skipped") or [],
                 artifact_cfg.get("output_usages") or
                 (run.preview_preset or {}).get("output_usages") or [])
             technical_passed = all(c.get("passed") for c in checks)
+            hypothesis_check = None
+            if hypothesis:
+                hypothesis_check = self._check_hypothesis(
+                    hypothesis, before_stats, after_stats,
+                    hypothesis_outcome, observed_effect)
 
             if accepted is None:
                 accepted = technical_passed and not comparisons.get("threshold_failures")
                 if before_stats is None:
                     accepted = technical_passed
+                if hypothesis_check and hypothesis_check["outcome"] == "refuted":
+                    # The change did not do what it was meant to; even a
+                    # regression-free result is not an improvement to keep.
+                    accepted = False
+                if appearance_regressions:
+                    accepted = False
+                if control is not None and not control["controlled"]:
+                    # An apparent improvement under different capture
+                    # settings proves nothing; the evaluator must decide.
+                    accepted = False
             accepted = bool(accepted)
 
             evaluation = MaterialEvaluation(
@@ -1715,7 +1950,8 @@ class MaterialRunController:
                 baseline_revision_id=revision.parent_revision_id,
                 comparisons=comparisons, technical_checks=checks,
                 technical_passed=technical_passed, warnings=warnings,
-                artifact_id=artifact.get("artifact_id"))
+                artifact_id=artifact.get("artifact_id"),
+                hypothesis_check=hypothesis_check)
             self.store.insert_evaluation(evaluation)
             self.store.update_candidate(candidate.candidate_id,
                                         status=CAND_EVALUATED)
@@ -1770,7 +2006,7 @@ class MaterialRunController:
                                       current_revision_id=applied_revision_id)
                 run = self.store.get_run(run.run_id)
                 reason = "candidate {} accepted".format(pending.candidate_id)
-                if run.iteration >= run.max_iterations:
+                if run.iteration >= run.max_iterations and not run.delivery_spec:
                     run = self._finalize_run(
                         run, reason="iteration budget exhausted ({} of {})".format(
                             run.iteration, run.max_iterations),
@@ -1826,9 +2062,35 @@ class MaterialRunController:
                     "finish_material_run requires state '{}' or '{}' (run is "
                     "'{}'). Decide the pending candidate first.".format(
                         STATE_CREATED, STATE_BASELINE_READY, run.state))
+            if run.delivery_spec and run.state == STATE_BASELINE_READY:
+                self._require_delivery(run, restore_best)
+                run = self.store.get_run(run.run_id)
             run = self._finalize_run(run, reason="finished by request",
                                      restore_best=restore_best, notes=notes)
             return {"run": self._public_run(run), "report": run.report}
+
+    def _require_delivery(self, run: MaterialRun, restore_best: bool) -> None:
+        """A run with a delivery spec only finishes once the revision it will
+        end on has passed an export validation."""
+        target_id = (run.best_revision_id if restore_best and run.best_revision_id
+                     else run.current_revision_id)
+        if target_id and target_id != run.current_revision_id:
+            target = self._require_revision(run, target_id)
+            self._restore_to_revision(run, target)
+            self.store.update_run(run.run_id, current_revision_id=target_id)
+            run = self.store.get_run(run.run_id)
+        revision = self._require_revision(run, run.current_revision_id)
+        record = run.delivery or {}
+        live = fingerprint_sha256(self._fingerprint(run))
+        if not (record.get("passed") and record.get("revision_id") == revision.revision_id
+                and record.get("source_fingerprint") == live):
+            record = self._validate_delivery(run, None, None)["delivery"]
+        if not record.get("passed"):
+            raise RunError(
+                "Delivery validation failed for revision '{}'; the run stays open. "
+                "Failed checks: {}".format(revision.revision_id, "; ".join(
+                    "{} ({})".format(c["name"], canonical_json(c["detail"]))
+                    for c in record.get("failed") or [])))
 
     def _finalize_run(self, run: MaterialRun, reason: str, restore_best: bool,
                       notes: Optional[str]) -> MaterialRun:
@@ -1982,6 +2244,369 @@ class MaterialRunController:
         }
         return validation
 
+    def _validate_hypothesis(self, run: MaterialRun, patch: MaterialPatch,
+                             hypothesis: Optional[dict], validation: dict) -> None:
+        """Normalise ``hypothesis`` onto ``patch`` and report problems into
+        ``validation`` (errors make the patch invalid)."""
+        errors = validation.setdefault("errors", [])
+        warnings = validation.setdefault("warnings", [])
+
+        def error(code: str, message: str) -> None:
+            errors.append({"code": code, "message": message})
+
+        def warn(code: str, message: str) -> None:
+            warnings.append({"code": code, "message": message})
+
+        if hypothesis is None:
+            if run.require_hypothesis:
+                error("missing_hypothesis",
+                      "This run requires a hypothesis: name the visual defect, the "
+                      "expected effect and measurable predictions.")
+            else:
+                warn("no_hypothesis",
+                     "No hypothesis given; the outcome of this change cannot be "
+                     "checked against a prediction.")
+            validation["valid"] = not errors
+            return
+        if not isinstance(hypothesis, dict):
+            error("bad_hypothesis", "'hypothesis' must be an object.")
+            validation["valid"] = False
+            return
+
+        unknown = sorted(set(hypothesis) - _HYPOTHESIS_KEYS)
+        if unknown:
+            error("bad_hypothesis", "Unknown hypothesis field(s): {}. Allowed: {}.".format(
+                ", ".join(unknown), ", ".join(sorted(_HYPOTHESIS_KEYS))))
+        normalized: Dict[str, Any] = {}
+        for key in ("defect", "expected_effect"):
+            value = hypothesis.get(key)
+            if not isinstance(value, str) or not value.strip():
+                error("bad_hypothesis",
+                      "hypothesis.{} is required and must be a non-empty string.".format(key))
+            else:
+                normalized[key] = value.strip()
+        rationale = hypothesis.get("rationale")
+        if rationale is not None:
+            if not isinstance(rationale, str):
+                error("bad_hypothesis", "hypothesis.rationale must be a string.")
+            else:
+                normalized["rationale"] = rationale.strip()
+        observed_in = hypothesis.get("observed_in")
+        if observed_in is not None:
+            if isinstance(observed_in, str):
+                observed_in = [observed_in]
+            if not isinstance(observed_in, list) or \
+                    not all(isinstance(o, str) and o for o in observed_in):
+                error("bad_hypothesis",
+                      "hypothesis.observed_in must be an output usage or a list of them.")
+            else:
+                normalized["observed_in"] = list(observed_in)
+
+        captured = {_norm_usage(u) for u in
+                    (run.preview_preset or {}).get("output_usages") or []}
+        predictions = hypothesis.get("predictions")
+        if predictions is None:
+            predictions = []
+        if not isinstance(predictions, list):
+            error("bad_hypothesis", "hypothesis.predictions must be a list.")
+            predictions = []
+        if len(predictions) > HYPOTHESIS_MAX_PREDICTIONS:
+            error("bad_hypothesis", "At most {} predictions are allowed (got {}).".format(
+                HYPOTHESIS_MAX_PREDICTIONS, len(predictions)))
+        normalized_predictions: List[dict] = []
+        for index, pred in enumerate(predictions):
+            label = "hypothesis.predictions[{}]".format(index)
+            if not isinstance(pred, dict):
+                error("bad_prediction", "{} must be an object.".format(label))
+                continue
+            bad = sorted(set(pred) - _PREDICTION_KEYS)
+            if bad:
+                error("bad_prediction", "{} has unknown field(s): {}. Allowed: {}.".format(
+                    label, ", ".join(bad), ", ".join(sorted(_PREDICTION_KEYS))))
+                continue
+            output = pred.get("output")
+            if not isinstance(output, str) or not output:
+                error("bad_prediction", "{} requires 'output' (an output usage).".format(label))
+                continue
+            metric = pred.get("metric", "mean")
+            if metric not in _METRICS:
+                error("bad_prediction", "{}.metric must be one of {}.".format(
+                    label, ", ".join(_METRICS)))
+                continue
+            direction = pred.get("direction")
+            if direction not in HYPOTHESIS_DIRECTIONS:
+                error("bad_prediction", "{}.direction must be one of {}.".format(
+                    label, ", ".join(HYPOTHESIS_DIRECTIONS)))
+                continue
+            entry: Dict[str, Any] = {"output": output, "metric": metric,
+                                     "direction": direction}
+            if pred.get("channel") is not None:
+                entry["channel"] = str(pred["channel"])
+            numbers_ok = True
+            for key in ("min_change", "max_change", "tolerance"):
+                if pred.get(key) is None:
+                    continue
+                value = pred[key]
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or value < 0:
+                    error("bad_prediction", "{}.{} must be a non-negative number "
+                          "(relative change, 0.1 = 10%).".format(label, key))
+                    numbers_ok = False
+                else:
+                    entry[key] = float(value)
+            if not numbers_ok:
+                continue
+            if direction == "unchanged" and ("min_change" in entry or "max_change" in entry):
+                error("bad_prediction", "{}: an 'unchanged' prediction takes "
+                      "'tolerance', not min_change/max_change.".format(label))
+                continue
+            if direction != "unchanged" and "tolerance" in entry:
+                error("bad_prediction", "{}: '{}' predictions take min_change/"
+                      "max_change, not 'tolerance'.".format(label, direction))
+                continue
+            if "min_change" in entry and "max_change" in entry and \
+                    entry["max_change"] < entry["min_change"]:
+                error("bad_prediction", "{}: max_change is below min_change.".format(label))
+                continue
+            if captured and _norm_usage(output) not in captured:
+                warn("prediction_not_captured",
+                     "{} targets output '{}', which the run's preview preset does "
+                     "not capture; it will be untestable.".format(label, output))
+            normalized_predictions.append(entry)
+        normalized["predictions"] = normalized_predictions
+        target_role = hypothesis.get("target_role")
+        if target_role is not None:
+            if target_role not in quality.ROLES:
+                error("bad_hypothesis", "hypothesis.target_role must be one of {}.".format(
+                    ", ".join(quality.ROLES)))
+            else:
+                normalized["target_role"] = target_role
+        self._check_patch_reach(run, patch, normalized, warn)
+        if not normalized_predictions and not errors:
+            warn("no_predictions",
+                 "The hypothesis has no measurable predictions; its outcome must be "
+                 "assessed with hypothesis_outcome at evaluation time.")
+
+        # Re-proposing a change that already failed to fix the defect wastes
+        # an iteration; flag it so the proposer can try something else.
+        operations = canonical_json([op.to_dict() for op in patch.operations])
+        for previous in self.store.list_candidates(run.run_id):
+            prior_ops = canonical_json((previous.patch or {}).get("operations") or [])
+            if prior_ops != operations:
+                continue
+            evaluation = self.store.latest_evaluation(previous.candidate_id)
+            outcome = ((evaluation.hypothesis_check or {}).get("outcome")
+                       if evaluation else None)
+            if outcome == "refuted" or previous.status == CAND_REJECTED:
+                warn("repeats_failed_candidate",
+                     "Candidate '{}' already tried these exact operations ({}).".format(
+                         previous.candidate_id,
+                         "hypothesis refuted" if outcome == "refuted" else "rejected"))
+                break
+
+        patch.hypothesis = normalized
+        validation["valid"] = not errors
+
+    def _check_patch_reach(self, run: MaterialRun, patch: MaterialPatch,
+                           hypothesis: dict, warn: Callable[[str, str], None]) -> None:
+        """Warn when edited nodes cannot affect what the hypothesis targets."""
+        targets = set(hypothesis.get("observed_in") or [])
+        targets |= {p["output"] for p in hypothesis.get("predictions") or []
+                    if p.get("direction") != "unchanged"}
+        role = hypothesis.get("target_role")
+        node_ops = [op for op in patch.operations
+                    if op.op == "set_parameter" and op.node_id]
+        if not node_ops or (not targets and not role):
+            return
+        revision = self.store.get_revision(run.current_revision_id) \
+            if run.current_revision_id else None
+        fingerprint = revision.fingerprint if revision else None
+        if not fingerprint:
+            return
+        analysis = quality.analyze_graph_roles(fingerprint)
+        if not analysis["outputs"]:
+            return
+        wanted = {quality.norm_usage(t) for t in targets}
+        for op in node_ops:
+            info = analysis["nodes"].get(op.node_id)
+            if info is None:
+                continue
+            reached = {quality.norm_usage(u) for u in info["influences"]}
+            if wanted and not (reached & wanted):
+                warn("node_not_upstream",
+                     "Node '{}' does not feed {} (it reaches: {}); this edit cannot "
+                     "produce the predicted effect.".format(
+                         op.node_id, ", ".join(sorted(targets)),
+                         ", ".join(sorted(info["influences"])) or "no outputs"))
+            if role and info["role"] and info["role"] != role:
+                warn("role_mismatch",
+                     "Node '{}' looks like {} ({}), not {}.".format(
+                         op.node_id, info["role"], info["reason"], role))
+
+    def analyze_graph(self, run_id: Optional[str] = None,
+                      graph_identifier: Optional[str] = None) -> dict:
+        """Classify the graph's nodes by role (macro shape, edge breakup,
+        surface grain, colour, roughness, ...) from a live fingerprint."""
+        with self._lock:
+            if graph_identifier:
+                fingerprint = self._call(CMD_FINGERPRINT,
+                                         {"graph_identifier": graph_identifier})
+            else:
+                run = self._require_run(run_id)
+                fingerprint = self._fingerprint(run)
+            return quality.analyze_graph_roles(fingerprint)
+
+    # ── delivery ─────────────────────────────────────────────────────────
+    def validate_delivery(self, run_id: Optional[str] = None,
+                          delivery: Optional[dict] = None,
+                          output_dir: Optional[str] = None) -> dict:
+        with self._lock:
+            run = self._require_run(run_id)
+            return self._validate_delivery(run, delivery, output_dir)
+
+    def _validate_delivery(self, run: MaterialRun, delivery: Optional[dict],
+                           output_dir: Optional[str]) -> dict:
+        if run.state in TERMINAL_STATES:
+            raise RunError("Run '{}' is {}.".format(run.run_id, run.state))
+        if run.state not in (STATE_BASELINE_READY, STATE_EVALUATED):
+            raise RunError("validate_material_delivery requires state '{}' or '{}' "
+                           "(run is '{}').".format(STATE_BASELINE_READY,
+                                                   STATE_EVALUATED, run.state))
+        base_spec = run.delivery_spec or quality.DEFAULT_DELIVERY_SPEC
+        merged = dict(base_spec)
+        merged.update(delivery or {})
+        spec, errors = quality.normalize_delivery_spec(merged)
+        if errors:
+            raise RunError("Invalid delivery spec: " + "; ".join(errors))
+        revision = self._require_revision(run, run.current_revision_id)
+        fingerprint = self._assert_no_drift(run, revision)
+        full_sha = fingerprint_sha256(fingerprint)
+        out_dir = os.path.abspath(output_dir) if output_dir else os.path.join(
+            self._run_dir(run.run_id), "delivery", "{:04d}".format(revision.seq))
+        os.makedirs(out_dir, exist_ok=True)
+        export = self._call(CMD_EXPORT_OUTPUTS, {
+            "graph_identifier": run.graph_identifier,
+            "output_dir": out_dir,
+            "output_usages": spec["required_outputs"],
+            "file_format": spec["file_format"],
+        })
+        exported = export.get("outputs") or []
+        preview = self.store.latest_artifact(run.run_id, kind="outputs_sheet",
+                                             revision_id=revision.revision_id)
+        result = quality.delivery_checks(spec, exported,
+                                         (preview or {}).get("stats"))
+        for skipped in export.get("skipped") or []:
+            result["warnings"].append("Export skipped '{}': {}".format(
+                skipped.get("usage"), skipped.get("reason")))
+        files = []
+        for entry in exported:
+            path = entry.get("path")
+            if path and os.path.isfile(path):
+                sha = sha256_file(path)
+                files.append({"usage": entry.get("usage"), "path": path, "sha256": sha,
+                              "width": entry.get("width"), "height": entry.get("height"),
+                              "pixel_format": entry.get("pixel_format")})
+                self.store.insert_artifact(
+                    run_id=run.run_id, revision_id=revision.revision_id,
+                    kind="delivery_export", path=path, sha256=sha,
+                    config={"usage": entry.get("usage"), "spec": spec},
+                    stats=None, source_fingerprint=full_sha)
+        record = {
+            "revision_id": revision.revision_id,
+            "source_fingerprint": full_sha,
+            "validated_at": self._clock(),
+            "passed": result["passed"],
+            "spec": spec,
+            "output_dir": out_dir,
+            "files": files,
+            "checks": result["checks"],
+            "failed": result["failed"],
+            "warnings": result["warnings"],
+        }
+        self.store.update_run(run.run_id, delivery=record)
+        return {"run": self._public_run(self.store.get_run(run.run_id), brief=True),
+                "delivery": record}
+
+    def _check_hypothesis(self, hypothesis: dict, before: Optional[dict],
+                          after: dict, assessed: Optional[str],
+                          observed_effect: Optional[str]) -> dict:
+        """Score each prediction against the base and candidate preview stats."""
+        results: List[dict] = []
+        for pred in hypothesis.get("predictions") or []:
+            metric = pred.get("metric", "mean")
+            bval = self._lookup_metric(before, pred.get("output"), pred.get("channel"), metric)
+            aval = self._lookup_metric(after, pred.get("output"), pred.get("channel"), metric)
+            entry = dict(pred)
+            entry.update({"before": bval, "after": aval})
+            if bval is None or aval is None:
+                entry["outcome"] = "untestable"
+                entry["reason"] = ("no base-revision stats" if bval is None
+                                   else "output/channel missing from the candidate preview")
+                results.append(entry)
+                continue
+            relative = (float(aval) - float(bval)) / max(abs(float(bval)), 1e-6)
+            entry["relative"] = round(relative, 6)
+            direction = pred["direction"]
+            if direction == "unchanged":
+                tolerance = pred.get("tolerance", DEFAULT_PREDICTION_TOLERANCE)
+                entry["outcome"] = "confirmed" if abs(relative) <= tolerance else "refuted"
+            else:
+                signed = relative if direction == "increase" else -relative
+                if signed < pred.get("min_change", DEFAULT_PREDICTION_TOLERANCE):
+                    entry["outcome"] = "refuted"
+                elif "max_change" in pred and signed > pred["max_change"]:
+                    entry["outcome"] = "overshot"
+                else:
+                    entry["outcome"] = "confirmed"
+            results.append(entry)
+
+        testable = [r for r in results if r["outcome"] != "untestable"]
+        confirmed = sum(1 for r in testable if r["outcome"] == "confirmed")
+        if not testable:
+            measured = "inconclusive"
+        elif confirmed == len(testable):
+            measured = "confirmed"
+        elif confirmed == 0:
+            measured = "refuted"
+        else:
+            measured = "partial"
+        return {
+            "defect": hypothesis.get("defect"),
+            "expected_effect": hypothesis.get("expected_effect"),
+            "predictions": results,
+            "measured_outcome": measured,
+            "assessed_outcome": assessed,
+            # The evaluator looked at the images; their call wins over stats.
+            "outcome": assessed or measured,
+            "observed_effect": observed_effect or "",
+        }
+
+    def _hypothesis_log(self, run: MaterialRun) -> List[dict]:
+        """One entry per hypothesis-carrying candidate, oldest first."""
+        log: List[dict] = []
+        for candidate in self.store.list_candidates(run.run_id):
+            hypothesis = (candidate.patch or {}).get("hypothesis")
+            if not hypothesis:
+                continue
+            evaluation = self.store.latest_evaluation(candidate.candidate_id)
+            check = (evaluation.hypothesis_check if evaluation else None) or {}
+            log.append({
+                "candidate_id": candidate.candidate_id,
+                "base_revision_id": candidate.revision_id,
+                "status": candidate.status,
+                "defect": hypothesis.get("defect"),
+                "observed_in": hypothesis.get("observed_in"),
+                "rationale": hypothesis.get("rationale"),
+                "expected_effect": hypothesis.get("expected_effect"),
+                "operations": (candidate.patch or {}).get("operations") or [],
+                "predictions": check.get("predictions") or hypothesis.get("predictions"),
+                "outcome": check.get("outcome"),
+                "measured_outcome": check.get("measured_outcome"),
+                "observed_effect": check.get("observed_effect"),
+                "accepted": (candidate.decision or {}).get("accepted"),
+            })
+        return log
+
     @staticmethod
     def _value_shape_error(value_type: str, value: Any) -> Optional[str]:
         if value_type in ("float", "int"):
@@ -2123,44 +2748,6 @@ class MaterialRunController:
             return first.get(metric)
         return None
 
-    def _compare_stats(self, before: Optional[dict], after: dict,
-                       threshold: float) -> dict:
-        comparisons: Dict[str, Any] = {
-            "threshold": threshold, "regressions": [], "improvements": [],
-            "threshold_failures": [], "skipped": False,
-        }
-        if not before:
-            comparisons["skipped"] = True
-            return comparisons
-        for usage, info in (after or {}).items():
-            before_info = None
-            for key, value in (before or {}).items():
-                if _norm_usage(key) == _norm_usage(usage):
-                    before_info = value
-                    break
-            if before_info is None:
-                continue
-            for channel, stats in (info.get("channels") or {}).items():
-                b = (before_info.get("channels") or {}).get(channel)
-                if not b:
-                    continue
-                for metric in ("mean", "min", "max"):
-                    bval, aval = b.get(metric), stats.get(metric)
-                    if bval is None or aval is None:
-                        continue
-                    denom = max(abs(float(bval)), 1e-6)
-                    relative = (float(aval) - float(bval)) / denom
-                    entry = {"output": usage, "channel": channel, "metric": metric,
-                             "before": bval, "after": aval,
-                             "relative": round(relative, 6)}
-                    if relative < -threshold:
-                        comparisons["regressions"].append(entry)
-                        if metric == "mean":
-                            comparisons["threshold_failures"].append(entry)
-                    elif relative > threshold:
-                        comparisons["improvements"].append(entry)
-        return comparisons
-
     # ══════════════════════════════════════════════════════════════════
     # Fingerprint-derived metadata
     # ══════════════════════════════════════════════════════════════════
@@ -2209,6 +2796,7 @@ class MaterialRunController:
             "evaluations": [self._public_evaluation(e) for e in
                             self.store.list_evaluations(run.run_id)],
             "pending_candidate": self._public_candidate(pending) if pending else None,
+            "hypothesis_log": self._hypothesis_log(run),
         }
         if include_artifacts:
             bundle["artifacts"] = self.store.list_artifacts(run.run_id)
@@ -2232,6 +2820,10 @@ class MaterialRunController:
             "updated_at": run.updated_at,
             "finished_at": run.finished_at,
             "error": run.error,
+            "require_hypothesis": run.require_hypothesis,
+            "appearance": run.appearance,
+            "delivery_required": bool(run.delivery_spec),
+            "delivery_passed": (run.delivery or {}).get("passed"),
         }
         if not brief:
             data.update({
@@ -2240,6 +2832,9 @@ class MaterialRunController:
                 "seeds": run.seeds,
                 "transitions": run.transitions,
                 "report": run.report,
+                "comparison_context": run.comparison_context,
+                "delivery_spec": run.delivery_spec,
+                "delivery": run.delivery,
             })
         return data
 
@@ -2302,6 +2897,7 @@ class MaterialRunController:
             "technical_passed": evaluation.technical_passed,
             "warnings": evaluation.warnings,
             "artifact_id": evaluation.artifact_id,
+            "hypothesis_check": evaluation.hypothesis_check,
         }
 
     def _build_report(self, run: MaterialRun, reason: str,
@@ -2347,6 +2943,7 @@ class MaterialRunController:
                 "candidate_id": c.candidate_id, "revision_id": c.revision_id,
                 "status": c.status,
                 "operations": ((c.patch or {}).get("operations") or []),
+                "hypothesis": (c.patch or {}).get("hypothesis"),
                 "decision": c.decision, "error": c.error,
             } for c in candidates],
             "evaluations": [{
@@ -2355,8 +2952,13 @@ class MaterialRunController:
                 "technical_passed": e.technical_passed,
                 "regression_threshold": e.regression_threshold,
                 "comparisons": e.comparisons,
+                "hypothesis_check": e.hypothesis_check,
                 "summary": e.summary,
             } for e in evaluations],
+            "hypothesis_log": self._hypothesis_log(run),
+            "appearance": run.appearance,
+            "comparison_context": run.comparison_context,
+            "delivery": run.delivery,
             "artifacts": by_revision,
             "reproducibility": {
                 "store": self.store.db_path,

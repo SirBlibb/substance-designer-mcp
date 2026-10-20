@@ -90,11 +90,12 @@ async def test_full_material_cycle_tools(client, material_env):
     preview = await client.call_tool(
         "capture_material_preview", {"run_id": run_id})
     assert not preview.isError
-    assert len(preview.content) == 3
+    assert len(preview.content) == 4
     payload = _json(preview)
     assert payload["technical_passed"] is True
     assert [a["kind"] for a in payload["artifacts"]] == [
-        "outputs_sheet", "render_3d"]
+        "outputs_sheet", "render_3d", "comparison_sheet"]
+    assert payload["comparison_control"]["controlled"] is True
     assert all(item.type == "image" for item in preview.content[1:])
 
     evaluation = _json(await client.call_tool(
@@ -111,6 +112,63 @@ async def test_full_material_cycle_tools(client, material_env):
         "finish_material_run", {"run_id": run_id, "notes": "done"}))
     assert finished["run"]["state"] == "finished"
     assert finished["report"]["iterations_used"] == 1
+
+
+async def test_hypothesis_tools_round_trip(client, material_env):
+    run = await _start(client, require_hypothesis=True)
+    run_id = run["run_id"]
+    assert run["require_hypothesis"] is True
+    await client.call_tool("checkpoint_material_revision", {"run_id": run_id})
+    await client.call_tool("capture_material_preview", {"run_id": run_id})
+    operations = [{"op": "set_parameter", "node_id": "blur",
+                   "parameter_id": "intensity", "value": 9.0}]
+
+    bare = await client.call_tool(
+        "propose_material_patch", {"run_id": run_id, "operations": operations})
+    assert bare.isError
+    assert "requires a hypothesis" in bare.content[0].text
+
+    await client.call_tool("propose_material_patch", {
+        "run_id": run_id, "operations": operations,
+        "hypothesis": {
+            "defect": "roughness too dark on peaks",
+            "expected_effect": "roughness brightens",
+            "predictions": [{"output": "roughness", "direction": "increase",
+                             "min_change": 0.1}]}})
+    await client.call_tool("apply_material_patch", {"run_id": run_id})
+    await client.call_tool("capture_material_preview", {"run_id": run_id})
+    evaluation = _json(await client.call_tool("record_material_evaluation", {
+        "run_id": run_id, "observed_effect": "peaks lighter",
+        "hypothesis_outcome": "confirmed"}))["evaluation"]
+    assert evaluation["hypothesis_check"]["measured_outcome"] == "confirmed"
+    assert evaluation["hypothesis_check"]["observed_effect"] == "peaks lighter"
+
+    bundle = _json(await client.call_tool("get_material_run", {"run_id": run_id}))
+    assert [e["defect"] for e in bundle["hypothesis_log"]] == [
+        "roughness too dark on peaks"]
+
+
+async def test_graph_analysis_and_delivery_tools(client, material_env):
+    material_env.export_bits = 16
+    run = await _start(client, material_profile="dielectric", delivery={})
+    run_id = run["run_id"]
+    assert run["appearance"]["profile"] == "dielectric"
+    assert run["delivery_required"] is True
+
+    analysis = _json(await client.call_tool(
+        "analyze_material_graph", {"graph_identifier": "G"}))
+    assert analysis["nodes"]["noise"]["role"] == "surface_grain"
+    assert "Roughness" in analysis["outputs"]
+
+    await client.call_tool("checkpoint_material_revision", {"run_id": run_id})
+    delivery = _json(await client.call_tool(
+        "validate_material_delivery", {"run_id": run_id}))["delivery"]
+    assert delivery["passed"] is True
+    assert all(os.path.isfile(f["path"]) for f in delivery["files"])
+
+    finished = _json(await client.call_tool(
+        "finish_material_run", {"run_id": run_id}))
+    assert finished["report"]["delivery"]["passed"] is True
 
 
 async def test_rejected_candidate_tool_restores_base(client, material_env):

@@ -7,6 +7,32 @@ All notable changes to the Substance Designer MCP Plugin are documented here.
 ## [Unreleased]
 
 ### Bridge (v2.5.0)
+- **Material-aware evaluation**: `start_material_run(material_profile=...,
+  appearance_targets=...)` records the intended look. Evaluation classifies
+  each change as toward/within/away from target, intended (predicted) or a side
+  effect, and only failing the intended look counts as a regression.
+- **Controlled comparisons**: the first capture locks the comparison context
+  (outputs, sheet size, bins, map resolution/format, graph output size, 3D render
+  size/timing). Mismatched before/after pairs are flagged and not auto-accepted,
+  and captures add a before|after `comparison_sheet`.
+- **`analyze_material_graph`**: node roles (macro shape, edge breakup, surface
+  grain, colour, roughness, metallic...) from the graph topology, plus
+  `node_not_upstream` / `role_mismatch` warnings on patches.
+- **`validate_material_delivery`**: export plus checks of required outputs,
+  format, resolution, bit depth and file headers. Runs started with `delivery`
+  only finish once the final revision passes.
+
+### Plugin (v3.10.0)
+- `export_outputs` (compute and save each graph output via `SDTexture.save`)
+  and `compose_comparison` (side-by-side image with labels).
+- **Hypothesis-driven refinement** for material runs: `propose_material_patch`
+  takes a `hypothesis` (the visual defect, expected effect and measurable
+  per-output predictions), `record_material_evaluation` scores the predictions
+  against the base/candidate stats (`hypothesis_check`) and accepts an
+  evaluator `hypothesis_outcome` / `observed_effect`. Refuted hypotheses are not
+  auto-accepted, repeating a failed change is flagged, runs expose a
+  `hypothesis_log`, and `start_material_run(require_hypothesis=True)` enforces
+  it. Existing run stores are migrated in place.
 - **Material runs**: a persistent, versioned iteration workflow built on the
   existing tools. Runs, revisions, candidates, evaluations and artifacts live in
   SQLite under `%LOCALAPPDATA%/sd_mcp/runs` (override with `--runs-dir` or

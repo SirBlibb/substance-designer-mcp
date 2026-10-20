@@ -146,7 +146,7 @@ def _parse_ports(raw):
 
 
 DEFAULT_PORTS     = _parse_ports(os.environ.get("SD_MCP_PORT")) or [9881]
-PLUGIN_VERSION    = (3, 9, 0)
+PLUGIN_VERSION    = (3, 10, 0)
 HEADER_SIZE       = 4
 COMMAND_TIMEOUT   = _env_int("SD_MCP_COMMAND_TIMEOUT", 120)
 COMMAND_TIMEOUT_MAX = _env_int("SD_MCP_COMMAND_TIMEOUT_MAX", 600)
@@ -1085,6 +1085,8 @@ class CommandHandler:
             "checkpoint_package":     self.checkpoint_package,
             "verify_checkpoint":      self.verify_checkpoint,
             "restore_package":        self.restore_package,
+            "export_outputs":         self.export_outputs,
+            "compose_comparison":     self.compose_comparison,
             # ── Documentation ──
             "list_documentation":     self.list_documentation,
             # ── Development ──
@@ -3393,6 +3395,126 @@ class CommandHandler:
                          "rows": sheet["rows"],
                          "outputs": outputs,
                          "skipped": skipped}
+
+    def export_outputs(self, graph_identifier=None, output_dir=None,
+                       output_usages=None, file_format="png",
+                       name_pattern="{graph}_{usage}"):
+        """Compute the graph and write each graph output to an image file.
+
+        SDTexture.save picks the encoder from the extension and keeps the
+        texture's bit depth where the format supports it (PNG 8/16-bit,
+        TIFF 8/16-bit, EXR half/float). output_usages selects outputs by
+        label/usage (default: every graph output). Outputs that cannot be
+        matched or saved are listed in 'skipped' instead of failing the call.
+
+        Returns {graph, output_dir, file_format, outputs: [{usage, label, node,
+        port_id, path, width, height, pixel_format, bytes}], skipped}.
+        """
+        if not output_dir:
+            raise ValueError("output_dir is required.")
+        fmt = str(file_format or "png").lower().lstrip(".")
+        if fmt not in ("png", "tga", "tif", "tiff", "exr", "jpg", "jpeg",
+                       "bmp", "dds", "psd"):
+            raise ValueError("Unsupported file_format '{}'.".format(file_format))
+        output_dir = os.path.abspath(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        graph = self._resolve_graph(graph_identifier)
+        gid = graph.getIdentifier()
+        try:
+            graph.compute()
+        except Exception as e:
+            raise RuntimeError(
+                "graph.compute() failed for '{}': {}".format(gid, e))
+
+        def _norm(value):
+            return "".join(c for c in (value or "").lower() if c.isalnum())
+
+        aliases = {"ao": "ambientocclusion"}
+        try:
+            array = graph.getOutputNodes()
+            out_nodes = [array.getItem(i) for i in range(array.getSize())]
+        except Exception:
+            out_nodes = [n for n in graph.getNodes()
+                         if self._get_node_def_id(n)
+                         == "sbs::compositing::output"]
+        by_label = {}
+        for out_node in out_nodes:
+            label = self._map_label(out_node) or out_node.getIdentifier()
+            by_label.setdefault(aliases.get(_norm(label), _norm(label)),
+                                (label, out_node))
+        if output_usages:
+            wanted = [str(u) for u in output_usages if str(u).strip()]
+        else:
+            wanted = [label for label, _ in by_label.values()]
+
+        outputs, skipped = [], []
+        for usage in wanted:
+            match = by_label.get(aliases.get(_norm(usage), _norm(usage)))
+            if match is None:
+                skipped.append({"usage": usage,
+                                "reason": "no output node matches; available: {}"
+                                .format(sorted(l for l, _ in by_label.values()))})
+                continue
+            label, node = match
+            try:
+                pid, texture = self._select_map_texture(node)
+                pixel_format = texture.getPixelFormat()
+                format_name = pixel_format.name if pixel_format is not None                     else "Unknown"
+                size = texture.getSize()
+                name = _sanitize_identifier(name_pattern.format(
+                    graph=gid, usage=usage, label=label)) or usage
+                path = os.path.join(output_dir, "{}.{}".format(name, fmt))
+                texture.save(path)
+                if not os.path.isfile(path):
+                    raise RuntimeError("SDTexture.save wrote no file")
+                outputs.append({
+                    "usage": usage, "label": label,
+                    "node": node.getIdentifier(), "port_id": pid,
+                    "path": path,
+                    "width": int(size.x) if size is not None else None,
+                    "height": int(size.y) if size is not None else None,
+                    "pixel_format": format_name,
+                    "bytes": os.path.getsize(path),
+                })
+            except Exception as e:
+                skipped.append({"usage": usage, "reason": str(e)})
+        return {"graph": gid, "output_dir": output_dir, "file_format": fmt,
+                "outputs": outputs, "skipped": skipped}
+
+    def compose_comparison(self, left_path, right_path, output_path,
+                           left_label="before", right_label="after"):
+        """Place two images side by side with a label band (before | after).
+
+        Used by material runs to put the base revision's contact sheet next
+        to the candidate's at identical scale, so a visual comparison is not
+        confounded by different zoom or layout. Returns {path, width, height}.
+        """
+        from PySide6.QtGui import QColor, QFont, QImage, QPainter
+        images = []
+        for path in (left_path, right_path):
+            image = QImage(path)
+            if image.isNull():
+                raise ValueError("Cannot read image '{}'.".format(path))
+            images.append(image)
+        gap, band = 12, 34
+        width = images[0].width() + gap + images[1].width()
+        height = band + max(images[0].height(), images[1].height())
+        canvas = QImage(width, height, QImage.Format_ARGB32)
+        canvas.fill(QColor(20, 21, 24))
+        painter = QPainter(canvas)
+        painter.setPen(QColor(245, 245, 245))
+        painter.setFont(QFont("Arial", 12, QFont.Bold))
+        x = 0
+        for image, label in zip(images, (left_label, right_label)):
+            painter.drawText(x + 8, 23, str(label))
+            painter.drawImage(x, band, image)
+            x += image.width() + gap
+        painter.end()
+        output_path = self._ensure_output_dir(os.path.abspath(output_path))
+        if not canvas.save(output_path):
+            raise RuntimeError("Failed to save image to '{}'.".format(output_path))
+        return {"path": output_path, "width": width, "height": height}
 
     # ═══════════════════════════════════════════════════════════════════════
     # ── STAGED LONG JOBS (progress + between-stage cancellation) ────────

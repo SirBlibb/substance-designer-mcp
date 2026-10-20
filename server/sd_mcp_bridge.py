@@ -22,6 +22,13 @@ Added in v2.5.0:
   The plugin gained checkpoint_package, restore_package, verify_checkpoint and
   graph_fingerprint (plugin v3.9.0). The controller is independent of Qt and
   runs every SD operation through the same one-at-a-time TCP transport.
+  Hypothesis-driven refinement: propose_material_patch takes a hypothesis
+  (visual defect, expected effect, measurable predictions) that
+  record_material_evaluation checks against the preview stats.
+  Material-aware evaluation (material_profile / appearance_targets), locked
+  comparison contexts with before|after sheets, analyze_material_graph (node
+  roles) and validate_material_delivery (export + PBR delivery checks; plugin
+  export_outputs / compose_comparison, v3.10.0).
 
 Added in v2.4.0:
   capture_node_preview: grabs each node's graph-editor tile (with SD's live
@@ -134,7 +141,7 @@ _HEAVY_TOOLS = frozenset({
     "capture_node_preview", "capture_3d_view", "send_to_3d_view",
     "execute_code", "save_package",
     "checkpoint_package", "restore_package", "verify_checkpoint",
-    "graph_fingerprint",
+    "graph_fingerprint", "export_outputs", "compose_comparison",
 })
 
 
@@ -436,6 +443,25 @@ record_material_evaluation -> decide_material_candidate (accept or restore the
 base), then repeat. finish_material_run restores the best accepted revision and
 closes the run. restore_material_revision returns to any checkpointed revision;
 verify_material_checkpoint proves a checkpoint file still matches.
+
+Refine hypothesis-first: each iteration should name ONE specific visual defect
+seen in the latest preview, propose a targeted change for it, and predict the
+effect. Pass that as propose_material_patch(hypothesis={defect, observed_in,
+rationale, expected_effect, predictions:[{output, metric, direction,
+min_change}]}); record_material_evaluation checks the predictions against the
+stats and reports confirmed/partial/refuted (pass hypothesis_outcome and
+observed_effect from your own look at the images). Read get_material_run's
+hypothesis_log before the next proposal so refuted ideas are not repeated.
+start_material_run(require_hypothesis=True) enforces this.
+Before choosing what to edit, call analyze_material_graph to see which nodes
+drive macro shape, edge breakup, surface grain, colour and roughness, and put
+the intended role in hypothesis.target_role. Give the run its intended look
+(material_profile and/or appearance_targets) so evaluation judges changes
+against it rather than by sign; keep the 3D view (camera, lighting, tiling)
+untouched during a run, because only the capture settings are verifiable.
+Pass delivery={...} to start_material_run when the material must ship; then
+validate_material_delivery exports and checks outputs, resolution and bit
+depth, and finish_material_run refuses until that passes.
 
 When a build fails, retry with preflight=True on create_batch_graph first; for
 already-created partial graphs prefer cleanup_on_failure=True next time.
@@ -1796,7 +1822,12 @@ async def start_material_run(ctx: Context,
                              constraints: Optional[List[str]] = None,
                              seeds: Optional[Dict[str, Any]] = None,
                              package_index: int = 0,
-                             package_path: Optional[str] = None) -> str:
+                             package_path: Optional[str] = None,
+                             require_hypothesis: bool = False,
+                             material_profile: Optional[str] = None,
+                             appearance_targets: Optional[Dict[str, Any]] = None,
+                             appearance_description: Optional[str] = None,
+                             delivery: Optional[Dict[str, Any]] = None) -> str:
     """
     Start a versioned material-iteration run for one graph.
 
@@ -1815,6 +1846,21 @@ async def start_material_run(ctx: Context,
     - constraints: free-text constraints for the evaluator
     - seeds: optional reproducibility data (e.g. random seeds) kept with the run
     - package_index / package_path: which loaded user package holds the graph
+    - require_hypothesis: refuse patches that do not carry a hypothesis
+      (defect -> targeted change -> predicted effect); see propose_material_patch
+    - material_profile: intended material class seeding loose PBR bands:
+      dielectric, metal, rough_dielectric, glossy_dielectric
+    - appearance_targets: intended per-output ranges, overriding the profile:
+      {"roughness": {"mean": [0.55, 0.8]}, "height": {"mean": [0.35, 0.6]},
+       "baseColor": {"mean": [0.25, 0.45], "channel": "r"}} (null = open end).
+      Evaluation then judges each change as toward/within/away from target;
+      unpredicted changes on untargeted outputs are side effects, not failures.
+    - appearance_description: free-text intended look, kept for the evaluator
+    - delivery: require an export check before finishing. {} uses defaults;
+      keys: required_outputs (default baseColor, normal, roughness, metallic,
+      height, ambientOcclusion), file_format (png), resolution
+      ([w_log2, h_log2] exact) or min_resolution_log2 (9), bit_depth
+      ({"default": 8, "height": 16}), require_square, require_uniform_size
     """
     runs = _material_runs()
     result = await _material_op(runs.start_run, graph_identifier,
@@ -1822,7 +1868,12 @@ async def start_material_run(ctx: Context,
                                 preview_preset=preview_preset,
                                 constraints=constraints, seeds=seeds,
                                 package_index=package_index,
-                                package_path=package_path)
+                                package_path=package_path,
+                                require_hypothesis=require_hypothesis,
+                                material_profile=material_profile,
+                                appearance_targets=appearance_targets,
+                                appearance_description=appearance_description,
+                                delivery=delivery if delivery is not None else None)
     return _material_json(result)
 
 
@@ -1833,7 +1884,9 @@ async def get_material_run(ctx: Context,
     """
     Get a run's state: goal, revision/candidate state, iteration budget,
     revisions, candidates, evaluations and artifacts (paths, hashes, trimmed
-    stats). Omit run_id for the most recently updated run.
+    stats), plus hypothesis_log: each hypothesis tried so far (defect, change,
+    predictions, outcome, accepted). Omit run_id for the most recently updated
+    run.
     """
     result = await _material_op(_material_runs().get_run, run_id,
                                 include_artifacts=include_artifacts)
@@ -1925,7 +1978,8 @@ async def restore_material_revision(ctx: Context,
 async def propose_material_patch(ctx: Context,
                                  run_id: Optional[str] = None,
                                  operations: Optional[List[Dict[str, Any]]] = None,
-                                 notes: Optional[str] = None) -> str:
+                                 notes: Optional[str] = None,
+                                 hypothesis: Optional[Dict[str, Any]] = None) -> str:
     """
     Propose a patch for the current revision. Does NOT modify the graph.
 
@@ -1936,11 +1990,31 @@ async def propose_material_patch(ctx: Context,
     value_type is optional (float/int/bool/string/float2/float3/float4/color/
     int2/int3/int4). Node ids and parameters are validated against the live
     graph, and the working graph must still match the run's current revision.
+    hypothesis (recommended; required when the run was started with
+    require_hypothesis=True) states why this change is being tried:
+      {"defect": "roughness is flat; wet and dry areas read the same",
+       "observed_in": ["roughness"],
+       "rationale": "the blur washes out the cavity mask driving roughness",
+       "expected_effect": "cavities read darker/glossier, peaks stay matte",
+       "predictions": [
+         {"output": "roughness", "metric": "mean", "direction": "decrease",
+          "min_change": 0.05, "max_change": 0.3},
+         {"output": "baseColor", "direction": "unchanged", "tolerance": 0.02}]}
+    defect and expected_effect are required. Each prediction names an output
+    usage, optional channel, metric (mean/min/max, default mean) and direction
+    (increase/decrease/unchanged); min_change/max_change/tolerance are relative
+    (0.1 = 10%, default 0.02). Repeating operations that an earlier candidate
+    already failed with is flagged as a warning. Optional target_role (one of
+    macro_shape, edge_breakup, surface_grain, height_processing, color,
+    roughness, metallic, normal_processing) is checked against
+    analyze_material_graph; editing a node that does not feed the targeted
+    outputs is flagged (node_not_upstream).
     Returns the candidate (id, validation result, patch digest); an invalid
     patch raises with every validation error.
     """
     result = await _material_op(_material_runs().propose_patch, run_id,
-                                operations=operations, notes=notes)
+                                operations=operations, notes=notes,
+                                hypothesis=hypothesis)
     return _material_json(result)
 
 
@@ -1985,6 +2059,12 @@ async def capture_material_preview(ctx: Context,
     best-effort: it needs the 3D view open in SD and is skipped with a warning
     if binding/capture fails. The graph must still match the current revision.
 
+    The run's first capture locks the comparison context (outputs, sheet size,
+    histogram bins, map resolution/pixel format, 3D render size and timing);
+    comparison_control reports any mismatch, and overriding preset arguments
+    makes later comparisons uncontrolled. When the revision has a parent, a
+    before|after side-by-side sheet (comparison_sheet) is added.
+
     Returns JSON (artifact paths, technical checks, stats) followed by the
     contact sheet and 3D render images when return_image is True.
     """
@@ -2012,7 +2092,9 @@ async def record_material_evaluation(ctx: Context,
                                      evaluator: Optional[str] = None,
                                      summary: Optional[str] = None,
                                      criteria: Optional[List[str]] = None,
-                                     regression_threshold: float = 0.1) -> str:
+                                     regression_threshold: float = 0.1,
+                                     hypothesis_outcome: Optional[str] = None,
+                                     observed_effect: Optional[str] = None) -> str:
     """
     Record the evaluation of the applied candidate from its latest preview.
 
@@ -2027,13 +2109,26 @@ async def record_material_evaluation(ctx: Context,
     - criteria: checklist / notes that informed the verdict
     - regression_threshold: relative mean change treated as a regression
       (default 0.1 = 10%)
+    - hypothesis_outcome: your visual judgement of the candidate's hypothesis
+      (confirmed/partial/refuted/inconclusive); overrides the stats-measured
+      outcome. observed_effect: what actually changed in the images.
+    When the candidate has a hypothesis, hypothesis_check scores each
+    prediction against the base preview; a refuted hypothesis is not accepted
+    by default. With appearance targets (or a hypothesis), comparisons are
+    material-aware: changes are classified toward_target / within_target /
+    away_from_target / intended / side_effect, and only moving away from an
+    intended range fails. comparisons.control says whether before and after
+    were captured under the same settings; uncontrolled pairs and outputs that
+    leave their target range are not auto-accepted.
     Returns the evaluation incl. per-channel comparisons and accepted.
     """
     result = await _material_op(_material_runs().record_evaluation, run_id,
                                 verdict=verdict, score=score, accepted=accepted,
                                 evaluator=evaluator, summary=summary,
                                 criteria=criteria,
-                                regression_threshold=regression_threshold)
+                                regression_threshold=regression_threshold,
+                                hypothesis_outcome=hypothesis_outcome,
+                                observed_effect=observed_effect)
     return _material_json(result)
 
 
@@ -2071,10 +2166,57 @@ async def finish_material_run(ctx: Context,
 
     - restore_best: False leaves the working graph as-is.
     A pending candidate must be decided (or restored with
-    restore_material_revision) first.
+    restore_material_revision) first. When the run was started with
+    delivery, the final revision must pass validate_material_delivery (run
+    automatically if no passing record matches it); otherwise the run stays
+    open and the failed checks are returned as the error.
     """
     result = await _material_op(_material_runs().finish_run, run_id,
                                 notes=notes, restore_best=restore_best)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_READ_ONLY, structured_output=False)
+async def analyze_material_graph(ctx: Context,
+                                 graph_identifier: Optional[str] = None,
+                                 run_id: Optional[str] = None) -> str:
+    """
+    Explain what each node controls, so edits target the right part of the
+    material instead of adjusting parameters blindly. No compute.
+
+    Walks upstream from every graph output and classifies nodes as
+    macro_shape, edge_breakup, surface_grain, height_processing,
+    normal_processing, color, roughness, metallic (or output), using which
+    outputs they reach, their definition and frequency-like parameters
+    (scale/tiling/amount). Each node lists its role, reason, confidence,
+    influences ({output: distance}) and tunable_parameters; 'outputs' lists
+    each output's upstream chain. Pass graph_identifier, or run_id (default:
+    latest run) to analyze a run's graph. Treat confidence < 0.6 as a guess.
+    """
+    result = await _material_op(_material_runs().analyze_graph, run_id,
+                                graph_identifier=graph_identifier)
+    return _material_json(result)
+
+
+@mcp.tool(annotations=_ADDITIVE, structured_output=False)
+async def validate_material_delivery(ctx: Context,
+                                     run_id: Optional[str] = None,
+                                     delivery: Optional[Dict[str, Any]] = None,
+                                     output_dir: Optional[str] = None) -> str:
+    """
+    Export the current revision's outputs and validate them for delivery.
+
+    Writes each required output with SDTexture.save (default under the run
+    directory, or output_dir), then re-reads the files: present and non-empty,
+    expected file format, header dimensions/bit depth (PNG, TIFF, EXR headers
+    are parsed; otherwise the texture's pixel format is used), resolution,
+    square and uniform size. delivery overrides the run's delivery spec (see
+    start_material_run). Records the result on the run; finish_material_run
+    requires a passing record for runs started with delivery. Requires plugin
+    v3.10.0.
+    """
+    result = await _material_op(_material_runs().validate_delivery, run_id,
+                                delivery=delivery, output_dir=output_dir)
     return _material_json(result)
 
 
